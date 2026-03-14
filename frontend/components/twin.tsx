@@ -51,7 +51,7 @@ export default function Twin() {
                 }),
             });
 
-            if (!response.ok) throw new Error('Failed to send message');
+            if (!response.ok) throw new Error('Das Senden der Nachricht ist fehlgeschlagen');
 
             const data = await response.json();
 
@@ -73,7 +73,7 @@ export default function Twin() {
             const errorMessage: Message = {
                 id: (Date.now() + 1).toString(),
                 role: 'assistant',
-                content: 'Sorry, I encountered an error. Please try again.',
+                content: 'Entschuldigung, es ist ein Fehler aufgetreten. Bitte versuche es erneut.',
                 timestamp: new Date(),
             };
             setMessages(prev => [...prev, errorMessage]);
