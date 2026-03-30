@@ -1,3 +1,5 @@
+from platform import system
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -114,12 +116,6 @@ def call_bedrock(conversation: List[Dict], user_message: str) -> str:
     # Build messages in Bedrock format
     messages = []
 
-    # Add system prompt as first user message (Bedrock convention)
-    messages.append({
-        "role": "user",
-        "content": [{"text": f"System: {prompt()}"}]
-    })
-
     # Add conversation history (limit to last 10 exchanges as context)
     for msg in conversation[-20:]:  # Last 10 back-and-forth exchanges
         messages.append({
@@ -137,6 +133,7 @@ def call_bedrock(conversation: List[Dict], user_message: str) -> str:
         # Call Bedrock using the converse API
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
+            system = [{"text": prompt()}],
             messages=messages,
             inferenceConfig={
                 "maxTokens": 2000,
