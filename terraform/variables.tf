@@ -51,3 +51,33 @@ variable "root_domain" {
   type        = string
   default     = ""
 }
+
+variable "sagemaker_embedding_enabled" {
+  description = "Create a SageMaker serverless endpoint for embeddings"
+  type        = bool
+  default     = false
+}
+
+variable "sagemaker_embedding_model_name" {
+  description = "Huggingface model ID for embeddings"
+  type        = string
+  default     = "sentence-transformers/all-MiniLM-L6-v2"
+}
+
+variable "sagemaker_embedding_image_uri" {
+  description = "Region-specific Huggingface SageMaker inference image URI"
+  type        = string
+  default     = ""
+}
+
+variable "sagemaker_embedding_serverless_memory_mb" {
+  description = "Memory size for the SageMaker serverless embedding endpoint"
+  type        = number
+  default     = 3072
+}
+
+variable "sagemaker_embedding_max_concurrency" {
+  description = "Max concurrency for the SageMaker serverless embedding endpoint"
+  type        = number
+  default     = 2
+}
