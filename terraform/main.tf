@@ -39,6 +39,35 @@ resource "aws_s3_bucket_ownership_controls" "memory" {
   }
 }
 
+# S3Vectors bucket for RAG
+resource "aws_s3vectors_vector_bucket" "rag" {
+  count = var.s3vectors_enabled ? 1 : 0
+
+  vector_bucket_name = "${local.name_prefix}-vectors-${data.aws_caller_identity.current.account_id}"
+
+  encryption_configuration {
+    sse_type = "AES256"
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_s3vectors_index" "rag" {
+  count              = var.s3vectors_enabled ? 1 : 0
+
+  data_type          = "float32"
+  dimension          = var.s3vectors_dimension
+  distance_metric    = var.s3vectors_distance_metric
+  index_name         = var.s3vectors_index_name
+  vector_bucket_name = aws_s3vectors_vector_bucket.rag[0].vector_bucket_name
+
+  metadata_configuration {
+    non_filterable_metadata_keys = var.s3vectors_non_filterable_metadata_keys
+  }
+
+  tags = local.common_tags
+}
+
 # S3 bucket for frontend static website
 resource "aws_s3_bucket" "frontend" {
   bucket = "${local.name_prefix}-frontend-${data.aws_caller_identity.current.account_id}"
