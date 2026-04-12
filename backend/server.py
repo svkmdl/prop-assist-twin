@@ -75,6 +75,9 @@ class Message(BaseModel):
     content: str
     timestamp: str
 
+# Embedding model
+class EmbedRequest(BaseModel):
+    text: str
 
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
@@ -202,6 +205,9 @@ async def health_check():
         "sagemaker_endpoint_configure" : bool(SAGEMAKER_ENDPOINT)
     }
 
+@app.post("/embed")
+async def embed(request: EmbedRequest):
+    return {"embedding": get_embedding(request.text)}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
