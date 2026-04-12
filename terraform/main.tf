@@ -119,6 +119,31 @@ resource "aws_iam_role_policy_attachment" "lambda_s3" {
   role       = aws_iam_role.lambda_role.name
 }
 
+resource "aws_iam_role" "sagemaker_role" {
+  count = var.sagemaker_embedding_enabled ? 1 : 0
+  name  = "${local.name_prefix}-sagemaker-role"
+  tags  = local.common_tags
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "sagemaker.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
+  count      = var.sagemaker_embedding_enabled ? 1 : 0
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+  role       = aws_iam_role.sagemaker_role[0].name
+}
+
 # Lambda function
 resource "aws_lambda_function" "api" {
   filename         = "${path.module}/../backend/lambda-deployment.zip"
