@@ -214,11 +214,28 @@ def index_text_chunk(
                 }
             }
         ]
-)
+    )
 
     return key
 
+def search_text_chunks(
+    query: str,
+    top_k: int = 5
+) -> List[Dict]:
+    if not VECTOR_BUCKET or not VECTOR_INDEX:
+        raise HTTPException(status_code=500, detail="VECTOR_BUCKET or VECTOR_INDEX not configured")
 
+    query_embedding =  get_embedding(query)
+
+    response = s3vectors_client.query_vectors(
+        vectorBucketName=VECTOR_BUCKET,
+        indexName=VECTOR_INDEX,
+        queryVector={"float32": [float(x) for x in query_embedding]},
+        topK=top_k,
+        returnDistance=True,
+        returnMetadata=True
+    )
+    return response.get("vectors", [])
 
 @app.get("/")
 async def root():
