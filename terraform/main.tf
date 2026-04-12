@@ -178,6 +178,29 @@ resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
   role       = aws_iam_role.sagemaker_role[0].name
 }
 
+resource "aws_iam_role_policy" "lambda_s3vectors" {
+  count = var.s3vectors_enabled ? 1 : 0
+  name  = "${local.name_prefix}-lambda-s3vectors"
+  role   = aws_iam_role.lambda_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3vectors:PutVectors",
+          "s3vectors:GetVectors",
+          "s3vectors:DeleteVectors",
+          "s3vectors:QueryVectors"
+        ]
+        Resource = [
+          aws_s3vectors_index.rag[0].index_arn
+        ]
+      },
+    ]
+  })
+}
+
 # Sagemaker embedding model
 resource "aws_sagemaker_model" "embedding_model" {
   count              = var.sagemaker_embedding_enabled ? 1 : 0
