@@ -175,6 +175,12 @@ resource "aws_sagemaker_endpoint_configuration" "embedding_endpoint_config" {
   }
 }
 
+resource "aws_sagemaker_endpoint" "embedding_endpoint" {
+  count                = var.sagemaker_embedding_enabled ? 1 : 0
+  name                 = "${local.name_prefix}-embedding-endpoint"
+  endpoint_config_name = aws_sagemaker_endpoint_configuration.embedding_endpoint_config[0].name
+}
+
 # Lambda function
 resource "aws_lambda_function" "api" {
   filename         = "${path.module}/../backend/lambda-deployment.zip"
