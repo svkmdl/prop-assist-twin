@@ -3,6 +3,6 @@ uvicorn
 # openai # switching to bedrock
 python-dotenv
 python-multipart
-boto3
+boto3>=1.42.69
 pypdf
 mangum
