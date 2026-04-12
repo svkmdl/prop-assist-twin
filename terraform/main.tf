@@ -161,6 +161,20 @@ resource "aws_sagemaker_model" "embedding_model" {
     depends_on = [aws_iam_role_policy_attachment.sagemaker_full_access]
 }
 
+resource "aws_sagemaker_endpoint_configuration" "embedding_endpoint_config" {
+    count = var.sagemaker_embedding_enabled ? 1 : 0
+    name  = "${local.name_prefix}-embedding-endpoint-config"
+
+    production_variants {
+        model_name             = aws_sagemaker_model.embedding_model[0].name
+
+        serverless_config {
+            memory_size_in_mb = var.sagemaker_embedding_serverless_memory_mb
+            max_concurrency   = var.sagemaker_embedding_max_concurrency
+        }
+    }
+}
+
 # Lambda function
 resource "aws_lambda_function" "api" {
   filename         = "${path.module}/../backend/lambda-deployment.zip"
