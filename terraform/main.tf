@@ -144,6 +144,23 @@ resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
   role       = aws_iam_role.sagemaker_role[0].name
 }
 
+# Sagemaker embedding model
+resource "aws_sagemaker_model" "embedding_model" {
+    count              = var.sagemaker_embedding_enabled ? 1 : 0
+    name               = "${local.name_prefix}-embedding-model"
+    execution_role_arn = aws_iam_role.sagemaker_role[0].arn
+
+    primary_container {
+        image = var.sagemaker_embedding_image_uri
+        environment = {
+        HF_MODEL_ID = var.sagemaker_embedding_model_name
+        HF_TASK     = "feature-extraction"
+        }
+    }
+
+    depends_on = [aws_iam_role_policy_attachment.sagemaker_full_access]
+}
+
 # Lambda function
 resource "aws_lambda_function" "api" {
   filename         = "${path.module}/../backend/lambda-deployment.zip"
