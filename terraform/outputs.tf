@@ -27,3 +27,13 @@ output "custom_domain_url" {
   description = "Root URL of the production site"
   value       = var.use_custom_domain ? "https://${var.root_domain}" : ""
 }
+
+output "sagemaker_embedding_endpoint_name" {
+  description = "Name of the SageMaker embedding endpoint"
+  value       = try(aws_sagemaker_endpoint.embedding_endpoint[0].name, "")
+}
+
+output "sagemaker_embedding_endpoint_arn" {
+  description = "ARN of the SageMaker embedding endpoint"
+  value       = try(aws_sagemaker_endpoint.embedding_endpoint[0].arn, "")
+}
