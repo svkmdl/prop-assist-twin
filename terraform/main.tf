@@ -146,33 +146,33 @@ resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
 
 # Sagemaker embedding model
 resource "aws_sagemaker_model" "embedding_model" {
-    count              = var.sagemaker_embedding_enabled ? 1 : 0
-    name               = "${local.name_prefix}-embedding-model"
-    execution_role_arn = aws_iam_role.sagemaker_role[0].arn
+  count              = var.sagemaker_embedding_enabled ? 1 : 0
+  name               = "${local.name_prefix}-embedding-model"
+  execution_role_arn = aws_iam_role.sagemaker_role[0].arn
 
-    primary_container {
-        image = var.sagemaker_embedding_image_uri
-        environment = {
-        HF_MODEL_ID = var.sagemaker_embedding_model_name
-        HF_TASK     = "feature-extraction"
-        }
-    }
+  primary_container {
+      image = var.sagemaker_embedding_image_uri
+      environment = {
+      HF_MODEL_ID = var.sagemaker_embedding_model_name
+      HF_TASK     = "feature-extraction"
+      }
+  }
 
-    depends_on = [aws_iam_role_policy_attachment.sagemaker_full_access]
+  depends_on = [aws_iam_role_policy_attachment.sagemaker_full_access]
 }
 
 resource "aws_sagemaker_endpoint_configuration" "embedding_endpoint_config" {
-    count = var.sagemaker_embedding_enabled ? 1 : 0
-    name  = "${local.name_prefix}-embedding-endpoint-config"
+  count = var.sagemaker_embedding_enabled ? 1 : 0
+  name  = "${local.name_prefix}-embedding-endpoint-config"
 
-    production_variants {
-        model_name             = aws_sagemaker_model.embedding_model[0].name
+  production_variants {
+      model_name             = aws_sagemaker_model.embedding_model[0].name
 
-        serverless_config {
-            memory_size_in_mb = var.sagemaker_embedding_serverless_memory_mb
-            max_concurrency   = var.sagemaker_embedding_max_concurrency
-        }
-    }
+      serverless_config {
+          memory_size_in_mb = var.sagemaker_embedding_serverless_memory_mb
+          max_concurrency   = var.sagemaker_embedding_max_concurrency
+      }
+  }
 }
 
 # Lambda function
