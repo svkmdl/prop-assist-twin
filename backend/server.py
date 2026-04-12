@@ -32,6 +32,12 @@ sagemaker_client = boto3.client(
     region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
 )
 
+# Initialize S3Vectors client
+s3vectors_client = boto3.client(
+    service_name="s3vectors",
+    region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+)
+
 # Initialize Bedrock client
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
@@ -54,21 +60,22 @@ MEMORY_DIR = os.getenv("MEMORY_DIR", "../memory")
 # SageMaker endpoint configuration (for embeddings)
 SAGEMAKER_ENDPOINT = os.getenv("SAGEMAKER_ENDPOINT", "")
 
+# S3Vectors configuration
+VECTOR_BUCKET = os.getenv("VECTOR_BUCKET", "")
+VECTOR_INDEX = os.getenv("VECTOR_INDEX", "")
+
 # Initialize S3 client if needed
 if USE_S3:
     s3_client = boto3.client("s3")
-
 
 # Request/Response models
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
-
 class ChatResponse(BaseModel):
     response: str
     session_id: str
-
 
 class Message(BaseModel):
     role: str
@@ -82,7 +89,6 @@ class EmbedRequest(BaseModel):
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
     return f"{session_id}.json"
-
 
 def load_conversation(session_id: str) -> List[Dict]:
     """Load conversation history from storage"""
@@ -102,7 +108,6 @@ def load_conversation(session_id: str) -> List[Dict]:
                 return json.load(f)
         return []
 
-
 def save_conversation(session_id: str, messages: List[Dict]):
     """Save conversation history to storage"""
     if USE_S3:
@@ -118,7 +123,6 @@ def save_conversation(session_id: str, messages: List[Dict]):
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
             json.dump(messages, f, indent=2)
-
 
 def call_bedrock(conversation: List[Dict], user_message: str) -> str:
     """Call AWS Bedrock with conversation history"""
@@ -195,7 +199,6 @@ async def root():
         "ai_model": BEDROCK_MODEL_ID
     }
 
-
 @app.get("/health")
 async def health_check():
     return {
@@ -243,7 +246,6 @@ async def chat(request: ChatRequest):
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/conversation/{session_id}")
 async def get_conversation(session_id: str):
