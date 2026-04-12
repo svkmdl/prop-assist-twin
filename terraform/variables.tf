@@ -81,3 +81,38 @@ variable "sagemaker_embedding_max_concurrency" {
   type        = number
   default     = 2
 }
+
+variable "s3vectors_enabled" {
+  description = "Create an S3 Vectors bucket and index for RAG embeddings"
+  type        = bool
+  default     = false
+}
+
+variable "s3vectors_index_name" {
+  description = "Index name inside the S3 Vectors bucket"
+  type        = string
+  default     = "property-kb"
+}
+
+variable "s3vectors_dimension" {
+   description = "Embedding dimension of the vector index in S3 Vectors"
+   type        = number
+   default     = 384
+}
+
+variable "s3vectors_distance_metric" {
+  description = "Distance metric for similarity search"
+  type        = string
+  default     = "cosine"
+
+  validation {
+    condition = contains(["cosine","euclidean"], var.s3vectors_distance_metric)
+    error_message = "s3vectors_distance_metric must be either 'cosine' or 'euclidean'."
+  }
+}
+
+variable "s3vectors_non_filterable_metadata_keys" {
+  description = "List of metadata keys that should be retrievable but not filterable in S3 Vectors"
+  type        = list(string)
+  default     = ["chunk_text"]
+}
