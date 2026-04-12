@@ -37,3 +37,23 @@ output "sagemaker_embedding_endpoint_arn" {
   description = "ARN of the SageMaker embedding endpoint"
   value       = try(aws_sagemaker_endpoint.embedding_endpoint[0].arn, "")
 }
+
+output "s3vectors_bucket_name" {
+  description = "Name of the S3Vectors Bucket"
+  value       = try(aws_s3vectors_vector_bucket.rag[0].vector_bucket_name, "")
+}
+
+output "s3vectors_bucket_arn" {
+  description = "ARN of the S3Vectors Bucket"
+  value       = try(aws_s3vectors_vector_bucket.rag[0].vector_bucket_arn, "")
+}
+
+output "s3vectors_index_name" {
+  description = "Name of the S3Vectors index"
+  value       = try(aws_s3vectors_index.rag[0].index_name, "")
+}
+
+output "s3vectors_index_arn" {
+  description = "ARN of the S3Vectors index"
+  value       = try(aws_s3vectors_index.rag[0].index_arn, "")
+}
