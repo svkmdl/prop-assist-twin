@@ -1,5 +1,3 @@
-from platform import system
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,6 +26,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize SageMaker client
+sagemaker_client = boto3.client(
+    service_name = "sagemaker-runtime",
+    region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+)
+
 # Initialize Bedrock client
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
@@ -46,6 +50,9 @@ BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "eu.amazon.nova-lite-v1:0")
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 MEMORY_DIR = os.getenv("MEMORY_DIR", "../memory")
+
+# SageMaker endpoint configuration (for embeddings)
+SAGEMAKER_ENDPOINT = os.getenv("SAGEMAKER_ENDPOINT", "")
 
 # Initialize S3 client if needed
 if USE_S3:
@@ -158,6 +165,23 @@ def call_bedrock(conversation: List[Dict], user_message: str) -> str:
             print(f"Bedrock error: {e}")
             raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
+def get_embedding(text: str) -> List[float]:
+    if not SAGEMAKER_ENDPOINT:
+        raise HTTPException(status_code=500, detail="SAGEMAKER ENDPOINT not configured")
+
+    response = sagemaker_client.invoke_endpoint(
+        EndpointName=SAGEMAKER_ENDPOINT,
+        ContentType="application/json",
+        Body=json.dumps({"inputs": text})
+    )
+    result = json.loads(response["Body"].read().decode())
+
+    if isinstance(result, list) and len(result) > 0:
+        if isinstance(result[0], list) and len(result[0]) > 0:
+            if isinstance(result[0][0], list):
+                return result[0][0]
+            return result[0]
+    return result
 
 @app.get("/")
 async def root():
@@ -174,7 +198,8 @@ async def health_check():
     return {
         "status": "healthy",
         "use_s3": USE_S3,
-        "bedrock_model": BEDROCK_MODEL_ID
+        "bedrock_model": BEDROCK_MODEL_ID,
+        "sagemaker_endpoint_configure" : bool(SAGEMAKER_ENDPOINT)
     }
 
 
