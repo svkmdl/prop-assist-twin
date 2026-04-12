@@ -216,6 +216,10 @@ def index_text_chunk(
         ]
 )
 
+    return key
+
+
+
 @app.get("/")
 async def root():
     return {
