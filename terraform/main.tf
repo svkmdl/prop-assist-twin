@@ -119,6 +119,11 @@ resource "aws_iam_role_policy_attachment" "lambda_s3" {
   role       = aws_iam_role.lambda_role.name
 }
 
+resource "aws_iam_role_policy_attachment" "lambda_sagemaker" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+  role       = aws_iam_role.lambda_role.name
+}
+
 resource "aws_iam_role" "sagemaker_role" {
   count = var.sagemaker_embedding_enabled ? 1 : 0
   name  = "${local.name_prefix}-sagemaker-role"
