@@ -3,6 +3,16 @@
 import { useState, useRef, useEffect } from 'react';
 import { Send, Bot, User } from 'lucide-react';
 
+interface SourceItem {
+  id: string;
+  title?: string;
+  source_path?: string;
+  snippet: string;
+  doc_type?: string;
+  chunk_index?: number;
+  distance?: number | null;
+}
+
 interface Message {
     id: string;
     role: 'user' | 'assistant';
