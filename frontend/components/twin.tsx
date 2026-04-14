@@ -13,11 +13,19 @@ interface SourceItem {
   distance?: number | null;
 }
 
+interface ChatResponse {
+  response: string;
+  session_id: string;
+  sources?: SourceItem[];
+  retrieval_used?: boolean;
+}
+
 interface Message {
     id: string;
     role: 'user' | 'assistant';
     content: string;
     timestamp: Date;
+    sources?: SourceItem[];
 }
 
 export default function Twin() {
