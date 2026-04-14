@@ -73,6 +73,15 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
+class SourceItem(BaseModel):
+    id: str
+    title: Optional[str] = None
+    source_path: Optional[str] = None
+    snippet: str
+    doc_type: Optional[str] = None
+    chunk_index: Optional[int] = None
+    distance: Optional[float] = None
+
 class ChatResponse(BaseModel):
     response: str
     session_id: str
