@@ -71,7 +71,7 @@ export default function Twin() {
 
             if (!response.ok) throw new Error('Das Senden der Nachricht ist fehlgeschlagen');
 
-            const data = await response.json();
+            const data : ChatResponse = await response.json();
 
             if (!sessionId) {
                 setSessionId(data.session_id);
@@ -82,6 +82,7 @@ export default function Twin() {
                 role: 'assistant',
                 content: data.response,
                 timestamp: new Date(),
+                sources: data.sources ?? []
             };
 
             setMessages(prev => [...prev, assistantMessage]);
