@@ -45,7 +45,7 @@ flowchart LR
   * S3 (memory bucket) stores conversation history in deployed environments.
   * Route 53 + ACM are optional and only used when a custom domain is enabled.
 
-> `backend/server.py` also contains S3 Vectors helper functions and health metadata, but the current repo does not expose public HTTP routes for vector indexing/query and Terraform does not currently provision `VECTOR_BUCKET` / `VECTOR_INDEX`.
+> `backend/server.py` includes internal S3 Vectors helper functions and health metadata. The current repo does not expose public HTTP routes for vector indexing or query, but Terraform can provision an S3 Vectors bucket and index and pass their names to Lambda as `VECTOR_BUCKET` and `VECTOR_INDEX` when `s3vectors_enabled = true`.
 
 * * *
 
@@ -290,7 +290,7 @@ There are a few repo-level mismatches worth knowing about:
   * `backend/server.py` defaults to `eu.amazon.nova-lite-v1:0` locally.
   * Terraform defaults to `eu.amazon.nova-micro-v1:0`.
   * The checked-in `terraform/terraform.tfvars` file enables SageMaker embeddings by default.
-  * The checked-in `terraform/terraform.tfvars` file also contains `s3vectors_*` settings, but the current Terraform code does not declare or provision matching variables/resources yet.
+  * The checked-in `terraform/terraform.tfvars` file enables SageMaker embeddings and S3 Vectors by default. The current Terraform code declares the matching S3 Vectors variables, provisions the vector bucket and index when `s3vectors_enabled = true`, and passes their names to Lambda as `VECTOR_BUCKET` and `VECTOR_INDEX`.
 
 Set `BEDROCK_MODEL_ID` explicitly in every environment if you want the same model everywhere.
 
@@ -353,11 +353,31 @@ sagemaker_embedding_enabled = false
 sagemaker_embedding_image_uri = ""
 ```
 
+> **Production note:** `./scripts/deploy.sh prod <project-name>` runs `terraform apply -var-file=prod.tfvars ...` from the `terraform/` directory. Create `terraform/prod.tfvars` before running a production deployment.
+
 Notes:
 
   * `sagemaker_embedding_image_uri` is region-specific; the checked-in example is for `eu-central-1`.
   * When embeddings are enabled, Terraform provisions a serverless SageMaker endpoint and passes its name to Lambda as `SAGEMAKER_ENDPOINT`.
-  * The checked-in `terraform.tfvars` file contains `s3vectors_*` placeholders, but the current Terraform code does not wire them up yet, so they are intentionally not shown in the supported example above.
+  * S3 Vectors is configured separately; see the optional S3 Vectors section below.
+
+### S3 Vectors (optional)
+
+To enable S3 Vectors-backed helper functions in Lambda, add the following Terraform variables:
+
+```hcl
+s3vectors_enabled = true
+s3vectors_index_name = "property-kb"
+s3vectors_dimension = 384
+s3vectors_distance_metric = "cosine"
+```
+
+Notes:
+
+  * Terraform provisions the S3 Vectors bucket and index when `s3vectors_enabled = true`.
+  * Lambda receives the provisioned names as `VECTOR_BUCKET` and `VECTOR_INDEX`.
+  * The backend currently uses these values in internal helper functions and the `/health` payload.
+  * The repo does not currently expose public HTTP routes for vector indexing or query.
 
 ### Custom domain
 
@@ -443,8 +463,11 @@ It runs on:
 Required GitHub secrets:
 
   * `AWS_ROLE_ARN`
-  * `AWS_ACCOUNT_ID`
   * `DEFAULT_AWS_REGION`
+
+Optional / currently redundant:
+
+  * `AWS_ACCOUNT_ID` — the workflow exports this value, but the current deployment scripts derive the account ID with `aws sts get-caller-identity`.
 
 The workflow:
 
@@ -534,7 +557,7 @@ The backend currently defines:
   * `index_text_chunk(text, metadata=None, vector_id=None)`
   * `search_text_chunks(query, top_k=5)`
 
-These use the S3 Vectors client and require `VECTOR_BUCKET` + `VECTOR_INDEX`, but no FastAPI routes or Terraform resources are currently wired for them.
+These use the S3 Vectors client and require `VECTOR_BUCKET` + `VECTOR_INDEX`. Terraform can provision those resources and pass the resulting names to Lambda when `s3vectors_enabled = true`, but the backend does not currently expose them as public HTTP routes.
 
 * * *
 
@@ -572,7 +595,7 @@ These use the S3 Vectors client and require `VECTOR_BUCKET` + `VECTOR_INDEX`, bu
 ### Expected vector search support, but health reports `s3vectors_configured=false`
 
   * `s3vectors_configured` only becomes true when both `VECTOR_BUCKET` and `VECTOR_INDEX` are set.
-  * The current repo does not yet provision these through Terraform or expose public FastAPI routes for them.
+  * In Terraform-managed deployments, `VECTOR_BUCKET` and `VECTOR_INDEX` are populated automatically when `s3vectors_enabled = true`. The vector helper functions still are not exposed as public FastAPI routes.
 
 ### Custom domain does not come up
 
