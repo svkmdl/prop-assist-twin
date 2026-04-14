@@ -298,7 +298,11 @@ async def chat(request: ChatRequest):
         # Save conversation
         save_conversation(session_id, conversation)
 
-        return ChatResponse(response=assistant_response, session_id=session_id)
+        return ChatResponse(response=assistant_response,
+                            session_id=session_id,
+                            sources=[],
+                            retrieval_used=False
+        )
 
     except HTTPException:
         raise
