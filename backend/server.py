@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
@@ -85,6 +85,8 @@ class SourceItem(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+    sources: List[SourceItem] = Field(default_factory=list) # List of source objects; defaults to a fresh empty list
+    retrieval_used: bool = False
 
 class Message(BaseModel):
     role: str
