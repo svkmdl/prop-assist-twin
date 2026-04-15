@@ -152,6 +152,34 @@ export default function Twin() {
                             }`}
                         >
                             <p className="whitespace-pre-wrap">{message.content}</p>
+
+                            {/* Under the assistant message body, we render sources only when present */}
+                            {message.role === 'assistant' && message.sources && message.sources.length > 0 && (
+                                <div className="mt-3 border-t border-slate-200 pt-3">
+                                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                        Quellen
+                                    </p>
+                                    <div className="mt-2 space-y-2">
+                                        {message.sources.map((source, index) => (
+                                            <div
+                                                key={source.id}
+                                                className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-700"
+                                            >
+                                                <p className="font-medium text-slate-800">
+                                                    [S{index + 1}] {source.title || source.source_path || source.id}
+                                                </p>
+
+                                                {source.source_path && (
+                                                    <p className="mt-1 text-slate-500">{source.source_path}</p>
+                                                )}
+
+                                                <p className="mt-1 whitespace-pre-wrap">{source.snippet}</p>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
                             <p
                                 className={`text-xs mt-1 ${
                                     message.role === 'user' ? 'text-slate-300' : 'text-gray-500'
