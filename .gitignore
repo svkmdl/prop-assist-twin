@@ -36,6 +36,9 @@ week2/
 # conversation memory files
 memory/*
 
+# embedding vector files
+vectors_for_s3vectors.json
+
 # production/build outputs
 /build
 /dist
