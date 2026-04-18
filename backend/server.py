@@ -319,6 +319,23 @@ def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceIte
 
     return sources
 
+def shorten_snippet(text: str, max_chars: int = SOURCE_SNIPPET_CHARS) -> str:
+    """
+        Normalizes whitespace and truncates text to a maximum character length.
+
+        Args:
+            text: The raw string to be cleaned and shortened.
+            max_chars: The character limit, including the trailing ellipsis.
+
+        Returns:
+            A single-line string stripped of extra whitespace and truncated with '…'
+            if it exceeds max_chars.
+    """
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1].rstrip() + "…"
+
 def build_retrieval_block(sources: List[SourceItem]) -> str:
     """
         Formats a list of retrieved sources into a structured text block for model grounding.
