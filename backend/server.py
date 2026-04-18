@@ -301,6 +301,42 @@ def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceIte
 
     return sources
 
+def build_retrieval_block(sources: List[SourceItem]) -> str:
+    """
+        Formats a list of retrieved sources into a structured text block for model grounding.
+
+        This function constructs a system-level prompt section that provides the AI with
+        factual context, explicit citation rules, and formatted source metadata. Each
+        source is assigned a unique identifier (e.g., [S1], [S2]) for inline citation.
+
+        Args:
+            sources: A list of SourceItem objects containing the title, path, and text snippets.
+
+        Returns:
+            A formatted string containing the knowledge block and citation instructions,
+            or an empty string if no sources are provided.
+    """
+    if not sources:
+        return ""
+
+    lines = [
+        "## RETRIEVED KNOWLEDGE",
+        "Use retrieved knowledge only when it is relevant to the latest user request.",
+        "When you use a retrieved source, cite it inline as [S1], [S2], etc.",
+        "Do not invent citations and do not cite sources you did not use.",
+    ]
+
+    for index, source in enumerate(sources, start=1):
+        header = source.title or source.source_path or source.id
+        lines.append(f"[S{index}] {header}")
+
+        if source.source_path:
+            lines.append(f"Path: {source.source_path}")
+
+        lines.append(source.snippet)
+
+    return "\n".join(lines)
+
 @app.get("/")
 async def root():
     return {
