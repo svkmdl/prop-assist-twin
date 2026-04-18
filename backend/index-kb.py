@@ -26,7 +26,13 @@ def main():
                 records.append({
                     "key": f"{path.name}_{count}",
                     "data": {"float32": vector},
-                    "metadata": {"chunk_text": chunk, "source": path.name}
+                    "metadata": {
+                        "chunk_text": chunk,
+                        "source_path": str(path),
+                        "title": path.stem,
+                        "doc_type": path.suffix,
+                        "chunk_index": count
+                    }
                 })
                 print(f"✅ {path.name} [Chunk {count}]")
 
