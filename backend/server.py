@@ -280,42 +280,57 @@ def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceIte
     """
 
     if not is_rag_enabled():
+        logger.info("retrieval disabled")
         return []
 
     try:
         raw_results = search_text_chunks(query, top_k=top_k)
     except Exception as exc:
-        print(f"Retrieval failed: {exc}")
+        logger.warning("retrieval failed: %s", exc)
         return []
 
+    max_distance = float(MAX_RETRIEVAL_DISTANCE) if MAX_RETRIEVAL_DISTANCE else None
     sources: List[SourceItem] = []
     seen_snippets = set()
+    raw_distances = []
 
     for item in raw_results:
         metadata = item.get("metadata") or {}
-        snippet = (metadata.get("chunk_text") or "").strip()
-        if not snippet:
+        raw_snippet = (metadata.get("chunk_text") or "").strip()
+        distance = item.get("distance")
+
+        raw_distances.append(distance)
+
+        if not raw_snippet:
             continue
 
-        # Normalization: Standardize text to catch duplicates with different formatting
-        normalized = " ".join(snippet.split()).lower()
+        if max_distance is not None and isinstance(distance, (int, float)) and distance > max_distance:
+            continue
+
+        normalized = " ".join(raw_snippet.split()).lower()
         if normalized in seen_snippets:
             continue
         seen_snippets.add(normalized)
-
-        distance = item.get("distance")
 
         sources.append(
             SourceItem(
                 id=item.get("key") or str(uuid.uuid4()),
                 title=metadata.get("title"),
                 source_path=metadata.get("source_path"),
-                snippet=snippet,
+                snippet=shorten_snippet(raw_snippet),
                 doc_type=metadata.get("doc_type"),
                 chunk_index=metadata.get("chunk_index"),
                 distance=distance if isinstance(distance, (int, float)) else None,
             )
         )
+
+    logger.info(
+        "retrieval query=%r raw_hits=%s used_hits=%s distances=%s",
+        query,
+        len(raw_results),
+        len(sources),
+        raw_distances,
+    )
 
     return sources
 
