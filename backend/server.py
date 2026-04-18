@@ -255,6 +255,52 @@ def search_text_chunks(
 def is_rag_enabled() -> bool:
     return RAG_ENABLED and bool(SAGEMAKER_ENDPOINT and VECTOR_BUCKET and VECTOR_INDEX)
 
+def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceItem]:
+    """
+        Retrieves and cleans relevant document chunks based on a search query.
+        Performs deduplication to optimize the LLM's context window.
+    """
+
+    if not is_rag_enabled():
+        return []
+
+    try:
+        raw_results = search_text_chunks(query, top_k=top_k)
+    except Exception as exc:
+        print(f"Retrieval failed: {exc}")
+        return []
+
+    sources: List[SourceItem] = []
+    seen_snippets = set()
+
+    for item in raw_results:
+        metadata = item.get("metadata") or {}
+        snippet = (metadata.get("chunk_text") or "").strip()
+        if not snippet:
+            continue
+
+        # Normalization: Standardize text to catch duplicates with different formatting
+        normalized = " ".join(snippet.split()).lower()
+        if normalized in seen_snippets:
+            continue
+        seen_snippets.add(normalized)
+
+        distance = item.get("distance")
+
+        sources.append(
+            SourceItem(
+                id=item.get("key") or str(uuid.uuid4()),
+                title=metadata.get("title"),
+                source_path=metadata.get("source_path"),
+                snippet=snippet,
+                doc_type=metadata.get("doc_type"),
+                chunk_index=metadata.get("chunk_index"),
+                distance=distance if isinstance(distance, (int, float)) else None,
+            )
+        )
+
+    return sources
+
 @app.get("/")
 async def root():
     return {
