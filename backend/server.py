@@ -64,6 +64,10 @@ SAGEMAKER_ENDPOINT = os.getenv("SAGEMAKER_ENDPOINT", "")
 VECTOR_BUCKET = os.getenv("VECTOR_BUCKET", "")
 VECTOR_INDEX = os.getenv("VECTOR_INDEX", "")
 
+# RAG configuration
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "3"))
+
 # Initialize S3 client if needed
 if USE_S3:
     s3_client = boto3.client("s3")
@@ -247,6 +251,9 @@ def search_text_chunks(
         returnMetadata=True
     )
     return response.get("vectors", [])
+
+def is_rag_enabled() -> bool:
+    return RAG_ENABLED and bool(SAGEMAKER_ENDPOINT and VECTOR_BUCKET and VECTOR_INDEX)
 
 @app.get("/")
 async def root():
