@@ -363,7 +363,8 @@ async def health_check():
         "use_s3": USE_S3,
         "bedrock_model": BEDROCK_MODEL_ID,
         "sagemaker_endpoint_configure" : bool(SAGEMAKER_ENDPOINT),
-        "s3vectors_configured" : bool(VECTOR_BUCKET and VECTOR_INDEX)
+        "s3vectors_configured" : bool(VECTOR_BUCKET and VECTOR_INDEX),
+        "rag_enabled": is_rag_enabled()
     }
 
 @app.post("/embed")
