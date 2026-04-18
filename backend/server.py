@@ -139,8 +139,12 @@ def save_conversation(session_id: str, messages: List[Dict]):
         with open(file_path, "w") as f:
             json.dump(messages, f, indent=2)
 
-def call_bedrock(conversation: List[Dict], user_message: str) -> str:
-    """Call AWS Bedrock with conversation history"""
+def call_bedrock(
+        conversation: List[Dict],
+        user_message: str,
+        sources: Optional[List[SourceItem]] = None
+) -> str:
+    """Call AWS Bedrock with conversation history & optional RAG sources"""
 
     # Build messages in Bedrock format
     messages = []
@@ -158,11 +162,17 @@ def call_bedrock(conversation: List[Dict], user_message: str) -> str:
         "content": [{"text": user_message}]
     })
 
+    system_prompt = prompt()
+    retrieval_block = build_retrieval_block(sources or [])
+
+    if retrieval_block:
+        system_prompt = f"{system_prompt}\n\n{retrieval_block}"
+
     try:
         # Call Bedrock using the converse API
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
-            system = [{"text": prompt()}],
+            system = [{"text": system_prompt}],
             messages=messages,
             inferenceConfig={
                 "maxTokens": 2000,
