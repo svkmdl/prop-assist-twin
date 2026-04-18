@@ -380,8 +380,15 @@ async def chat(request: ChatRequest):
         # Load conversation history
         conversation = load_conversation(session_id)
 
+        # Retrieve sources
+        sources = retrieve_sources(request.message)
+
         # Call Bedrock for response
-        assistant_response = call_bedrock(conversation, request.message)
+        assistant_response = call_bedrock(
+            conversation,
+            request.message,
+            sources= sources
+        )
 
         # Update conversation history
         conversation.append(
@@ -398,10 +405,11 @@ async def chat(request: ChatRequest):
         # Save conversation
         save_conversation(session_id, conversation)
 
-        return ChatResponse(response=assistant_response,
-                            session_id=session_id,
-                            sources=[],
-                            retrieval_used=False
+        return ChatResponse(
+            response=assistant_response,
+            session_id=session_id,
+            sources=sources,
+            retrieval_used=bool(sources)
         )
 
     except HTTPException:
