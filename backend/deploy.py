@@ -38,9 +38,9 @@ def main():
             "--rm",
             "--platform", "linux/amd64",
             "--entrypoint", "bash",
-            "-v", f"{os.getcwd()}:/out",
+            "-v", f"{os.path.abspath('lambda-package')}:/out",
             "lambda-builder",
-            "cp", "-rn", "/var/task/.", "/out/"
+            "cp", "-a", "/var/task/.", "/out/"
         ],
         check=True,
     )
