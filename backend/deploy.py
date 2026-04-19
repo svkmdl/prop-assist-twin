@@ -36,8 +36,14 @@ def main():
             "/bin/sh",
             "-c",
             """
+            # Install required tools
+            yum install -y tar gzip && \
+            
+            # Install uv
             curl -LsSf https://astral.sh/uv/install.sh | sh && \
             source $HOME/.cargo/env && \
+            
+            # Install dependencies
             uv pip install \
                 --target /var/task/lambda-package \
                 -r /var/task/requirements.txt \
