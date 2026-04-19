@@ -61,7 +61,7 @@ jobs:
       - name: Install backend test deps
         run: |
           cd backend
-          python -m pip install -r requirements.txt
+          uv pip install -r requirements.txt --system
 
       - name: Run backend regression tests
         run: |
