@@ -35,7 +35,17 @@ def main():
             "public.ecr.aws/lambda/python:3.12",
             "/bin/sh",
             "-c",
-            "pip install --target /var/task/lambda-package -r /var/task/requirements.txt --platform manylinux2014_x86_64 --only-binary=:all: --upgrade",
+            """
+            curl -LsSf https://astral.sh/uv/install.sh | sh && \
+            source $HOME/.cargo/env && \
+            uv pip install \
+                --target /var/task/lambda-package \
+                -r /var/task/requirements.txt \
+                --platform linux/amd64 \
+                --python-version 3.12 \
+                --only-binary=:all: \
+                --system
+            """,
         ],
         check=True,
     )
