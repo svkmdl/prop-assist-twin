@@ -19,27 +19,23 @@ def main():
     # Install dependencies using Docker with Lambda runtime image
     print("Installing dependencies for Lambda runtime...")
 
-    # Build dependencies using Dockerfile
+    # Use the official AWS Lambda Python 3.12 image
+    # This ensures compatibility with Lambda's runtime environment
     subprocess.run(
         [
-            "docker", "build",
-            "--platform", "linux/amd64",
-            "-f", "Dockerfile.lambda-build",
-            "-t", "lambda-builder",
-            "."
-        ],
-        check=True,
-    )
-
-    # Extract built dependencies
-    subprocess.run(
-        [
-            "docker", "run",
+            "docker",
+            "run",
             "--rm",
-            "--platform", "linux/amd64",
-            "-v", f"{os.path.abspath('lambda-package')}:/out",
-            "lambda-builder",
-            "bash", "-c", "cp -a /var/task/. /out/"
+            "-v",
+            f"{os.getcwd()}:/var/task",
+            "--platform",
+            "linux/amd64",  # Force x86_64 architecture
+            "--entrypoint",
+            "",  # Override the default entrypoint
+            "public.ecr.aws/lambda/python:3.12",
+            "/bin/sh",
+            "-c",
+            "pip install --target /var/task/lambda-package -r /var/task/requirements.txt --platform manylinux2014_x86_64 --only-binary=:all: --upgrade",
         ],
         check=True,
     )
