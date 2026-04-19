@@ -1,0 +1,21 @@
+# Stage 1: get uv binary
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
+# Stage 2: Lambda build environment
+FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
+
+# Copy uv into Lambda image
+COPY --from=uv /uv /bin/uv
+
+# Set working directory
+WORKDIR /var/task
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install dependencies
+RUN /bin/uv pip install \
+    --target /var/task/lambda-package \
+    -r requirements.txt \
+    --python-version 3.12 \
+    --only-binary=:all:
