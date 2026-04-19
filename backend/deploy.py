@@ -37,10 +37,9 @@ def main():
             "docker", "run",
             "--rm",
             "--platform", "linux/amd64",
-            "--entrypoint", "bash",
             "-v", f"{os.path.abspath('lambda-package')}:/out",
             "lambda-builder",
-            "cp", "-a", "/var/task/.", "/out/"
+            "bash", "-c", "cp -a /var/task/. /out/"
         ],
         check=True,
     )
