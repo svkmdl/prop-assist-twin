@@ -1,4 +1,3 @@
-# backend/tests/test_retrieve_sources.py
 def test_retrieve_sources_dedupes_filters_and_shortens(server_module, monkeypatch):
     long_snippet = " ".join(["Spacious balcony near park"] * 20)
 
