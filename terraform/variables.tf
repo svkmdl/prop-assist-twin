@@ -116,3 +116,59 @@ variable "s3vectors_non_filterable_metadata_keys" {
   type        = list(string)
   default     = ["chunk_text"]
 }
+
+variable "default_aws_region" {
+  description = "Region used by backend clients inside Lambda"
+  type        = string
+  default     = "eu-central-1"
+}
+
+variable "rag_enabled" {
+  description = "Enable retrieval-augmented generation (RAG) in the backend"
+  type        = bool
+  default     = true
+}
+
+variable "retrieval_top_k" {
+  description = "How many vector search results to retrieve for RAG"
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.retrieval_top_k > 0
+    error_message = "retrieval_top_k must be greater than 0."
+  }
+}
+
+variable "log_level"{
+  description = "Backend log level"
+  type        = string
+  default     = "INFO"
+
+  validation {
+      condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], upper(var.log_level))
+      error_message = "log_level must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+  }
+}
+
+variable "max_retrieval_distance" {
+  description = "The maximum allowed distance for RAG context retrieval"
+  type        = number
+  default     = 0.5
+
+  validation {
+    condition     = var.max_retrieval_distance >= 0
+    error_message = "The max_retrieval_distance must be a non-negative number."
+  }
+}
+
+variable "source_snippet_chars" {
+  description = "The maximum number of characters allowed for RAG source snippets."
+  type        = number
+  default     = 280
+
+  validation {
+    condition     = var.source_snippet_chars > 0
+    error_message = "The source_snippet_chars must be a positive integer."
+  }
+}

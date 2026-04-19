@@ -27,22 +27,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DEFAULT_AWS_REGION = os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+
 # Initialize SageMaker client
 sagemaker_client = boto3.client(
     service_name = "sagemaker-runtime",
-    region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+    region_name=DEFAULT_AWS_REGION
 )
 
 # Initialize S3Vectors client
 s3vectors_client = boto3.client(
     service_name="s3vectors",
-    region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+    region_name=DEFAULT_AWS_REGION
 )
 
 # Initialize Bedrock client
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
-    region_name=os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
+    region_name=DEFAULT_AWS_REGION
 )
 
 # Bedrock model selection

@@ -1,3 +1,4 @@
+default_aws_region                        = "eu-central-1"
 project_name                              = "prop-assist-twin"
 environment                               = "dev"
 bedrock_model_id                          = "eu.amazon.nova-micro-v1:0"
@@ -18,3 +19,8 @@ s3vectors_distance_metric                 = "cosine"
 s3vectors_non_filterable_metadata_keys = [
   "chunk_text"
 ]
+rag_enabled                               = true
+retrieval_top_k                           = 3
+log_level                                 = "INFO"
+max_retrieval_distance                    = 0.5
+source_snippet_chars                      = 200

@@ -252,13 +252,19 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      CORS_ORIGINS       = var.use_custom_domain ? "https://${var.root_domain},https://www.${var.root_domain}" : "https://${aws_cloudfront_distribution.main.domain_name}"
-      S3_BUCKET          = aws_s3_bucket.memory.id
-      USE_S3             = "true"
-      BEDROCK_MODEL_ID   = var.bedrock_model_id
-      SAGEMAKER_ENDPOINT = try(aws_sagemaker_endpoint.embedding_endpoint[0].name, "")
-      VECTOR_BUCKET      = try(aws_s3vectors_vector_bucket.rag[0].vector_bucket_name, "")
-      VECTOR_INDEX       = try(aws_s3vectors_index.rag[0].index_name, "")
+      CORS_ORIGINS           = var.use_custom_domain ? "https://${var.root_domain},https://www.${var.root_domain}" : "https://${aws_cloudfront_distribution.main.domain_name}"
+      S3_BUCKET              = aws_s3_bucket.memory.id
+      USE_S3                 = "true"
+      BEDROCK_MODEL_ID       = var.bedrock_model_id
+      SAGEMAKER_ENDPOINT     = try(aws_sagemaker_endpoint.embedding_endpoint[0].name, "")
+      VECTOR_BUCKET          = try(aws_s3vectors_vector_bucket.rag[0].vector_bucket_name, "")
+      VECTOR_INDEX           = try(aws_s3vectors_index.rag[0].index_name, "")
+      DEFAULT_AWS_REGION     = var.default_aws_region
+      RAG_ENABLED            = tostring(var.rag_enabled)
+      RETRIEVAL_TOP_K        = tostring(var.retrieval_top_k)
+      LOG_LEVEL              = var.log_level
+      MAX_RETRIEVAL_DISTANCE = var.max_retrieval_distance
+      SOURCE_SNIPPET_CHARS   = tostring(var.source_snippet_chars)
     }
   }
 
