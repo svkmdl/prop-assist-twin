@@ -40,7 +40,7 @@ def main():
             "--entrypoint", "bash",
             "-v", f"{os.getcwd()}:/out",
             "lambda-builder",
-            "cp", "-r", "/var/task/lambda-package", "/out/"
+            "cp", "-rn", "/var/task/.", "/out/"
         ],
         check=True,
     )

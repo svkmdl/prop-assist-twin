@@ -15,7 +15,7 @@ COPY requirements.txt .
 
 # Install dependencies
 RUN /bin/uv pip install \
-    --target /var/task/lambda-package \
+    --target /var/task \
     -r requirements.txt \
     --python-version 3.12 \
     --only-binary=:all:
