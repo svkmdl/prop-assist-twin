@@ -6,9 +6,10 @@ dependencies = [
     "boto3>=1.42.69",
     "fastapi>=0.135.1",
     "mangum>=0.21.0",
-    "openai>=2.28.0",
     "pypdf>=6.9.0",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.22",
     "uvicorn>=0.41.0",
+    "pytest>=9.0.0",
+    "httpx>=0.28.1"
 ]
