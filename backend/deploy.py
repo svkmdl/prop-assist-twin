@@ -37,6 +37,7 @@ def main():
             "docker", "run",
             "--rm",
             "--platform", "linux/amd64",
+            "--entrypoint", "bash",
             "-v", f"{os.getcwd()}:/out",
             "lambda-builder",
             "cp", "-r", "/var/task/lambda-package", "/out/"
