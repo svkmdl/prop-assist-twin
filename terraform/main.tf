@@ -332,6 +332,12 @@ resource "aws_apigatewayv2_route" "post_embed" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "post_ingest" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /ingest"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
 # Lambda permission for API Gateway
 resource "aws_lambda_permission" "api_gw" {
   statement_id  = "AllowExecutionFromAPIGateway"
