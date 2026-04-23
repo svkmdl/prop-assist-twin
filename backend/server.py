@@ -239,31 +239,29 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
 
 def index_text_chunk(
     text: str,
-    metadata: Optional[Dict] = None,
-    vector_id: Optional[str] = None
+    vector_id: str,
+    metadata: Dict
 ) -> str:
     if not VECTOR_BUCKET or not VECTOR_INDEX:
         raise HTTPException(status_code=500, detail="VECTOR_BUCKET or VECTOR_INDEX not configured")
 
     embedding = get_embedding(text)
-    key = vector_id or str(uuid.uuid4())
 
     s3vectors_client.put_vectors(
         vectorBucketName=VECTOR_BUCKET,
         indexName=VECTOR_INDEX,
         vectors=[
             {
-                "key": key,
+                "key": vector_id,
                 "data": {"float32": [float(x) for x in embedding]},
                 "metadata": {
                     "chunk_text": text,
-                    **(metadata or {})
+                    **metadata
                 }
             }
         ]
     )
-
-    return key
+    return vector_id
 
 def search_text_chunks(
     query: str,
