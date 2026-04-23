@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
@@ -422,6 +422,40 @@ async def health_check():
 @app.post("/embed")
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
+
+@app.post("/ingest")
+async def ingest_file(file: UploadFile = File(...)):
+    if not file.filename.endswith(".md"):
+        raise HTTPException(status_code=400, detail="Only .md files are supported")
+
+    try:
+
+        content = (await file.read()).decode("utf-8")
+
+        chunks_processed = 0
+        for count, chunk in enumerate(chunk_text(content)):
+
+            vector_id = f"{file.filename}_{count}"
+
+            metadata = {
+                "source_path": f"api_upload/{file.filename}",
+                "title": file.filename.rsplit('.', 1)[0],
+                "doc_type": ".md",
+                "chunk_index": count
+            }
+
+            index_text_chunk(chunk, vector_id, metadata)
+            chunks_processed += 1
+
+        return {
+            "filename": file.filename,
+            "chunks_indexed": chunks_processed,
+            "status": "success"
+        }
+
+    except Exception as e:
+        logger.error(f"Ingestion failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ingestion error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
