@@ -265,6 +265,8 @@ resource "aws_lambda_function" "api" {
       LOG_LEVEL              = var.log_level
       MAX_RETRIEVAL_DISTANCE = var.max_retrieval_distance
       SOURCE_SNIPPET_CHARS   = tostring(var.source_snippet_chars)
+      CHUNK_SIZE             = tostring(var.chunk_size)
+      CHUNK_OVERLAP          = tostring(var.chunk_overlap)
     }
   }
 

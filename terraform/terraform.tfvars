@@ -24,3 +24,5 @@ retrieval_top_k                           = 3
 log_level                                 = "INFO"
 max_retrieval_distance                    = 0.5
 source_snippet_chars                      = 200
+chunk_size                                = 1500
+chunk_overlap                             = 200

@@ -73,6 +73,8 @@ RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_RETRIEVAL_DISTANCE = os.getenv("MAX_RETRIEVAL_DISTANCE", "").strip()
 SOURCE_SNIPPET_CHARS = int(os.getenv("SOURCE_SNIPPET_CHARS", "280"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
 # Set up logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -224,6 +226,16 @@ def get_embedding(text: str) -> List[float]:
                 return result[0][0]
             return result[0]
     return result
+
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+    """Generator that yields text chunks based on size and overlap."""
+    cursor = 0
+    while cursor < len(text):
+        chunk = text[cursor: cursor + size]
+        yield chunk
+        if cursor + size >= len(text):
+            break
+        cursor += (size - overlap)
 
 def index_text_chunk(
     text: str,

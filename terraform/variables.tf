@@ -172,3 +172,20 @@ variable "source_snippet_chars" {
     error_message = "The source_snippet_chars must be a positive integer."
   }
 }
+
+variable "chunk_size"{
+   description = "The number of characters in each chunk when splitting documents for RAG."
+   type        = number
+   default     = 1500
+
+   validation {
+     condition     = var.chunk_size > 0
+     error_message = "The chunk_size must be a positive integer."
+   }
+}
+
+variable "chunk_overlap" {
+  description = "The number of overlapping characters between chunks when splitting documents for RAG."
+  type        = number
+  default     = 200
+}
