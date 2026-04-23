@@ -444,7 +444,7 @@ async def ingest_file(file: UploadFile = File(...)):
                 "chunk_index": count
             }
 
-            index_text_chunk(chunk, vector_id, metadata)
+            index_text_chunk(chunk, vector_id, metadata) # TODO : use a ThreadPoolExecutor to run index_text_chunk in parallel
             chunks_processed += 1
 
         return {
