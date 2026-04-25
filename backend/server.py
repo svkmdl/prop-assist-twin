@@ -329,10 +329,15 @@ def get_lexical_score(query: str, document: str) -> float:
     intersection = query_words.intersection(doc_words)
     return len(intersection) / len(query_words)
 
-def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceItem]:
+def retrieve_sources(
+        query: str,
+        fetch_n: int = RAW_FETCH_SIZE,
+        return_n: int = FINAL_TOP_K
+) -> List[SourceItem]:
     """
-        Retrieves and cleans relevant document chunks based on a search query.
-        Performs deduplication to optimize the LLM's context window.
+        Retrieves sources using a two-stage process:
+        1. Fetch a large candidate pool (fetch_n).
+        2. Rerank by combined score and limit per-document chunks.
     """
 
     if not is_rag_enabled():
@@ -340,55 +345,74 @@ def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceIte
         return []
 
     try:
-        raw_results = search_text_chunks(query, top_k=top_k)
+        # The "Wide Net" fetch from Vector DB
+        raw_results = search_text_chunks(query, top_k=fetch_n)
+        logger.info(f"Vector DB returned {len(raw_results)} raw candidates.")
     except Exception as exc:
-        logger.warning("retrieval failed: %s", exc)
+        logger.error(f"Vector search failed: {exc}", exc_info=True)
         return []
 
-    max_distance = float(MAX_RETRIEVAL_DISTANCE) if MAX_RETRIEVAL_DISTANCE else None
-    sources: List[SourceItem] = []
-    seen_snippets = set()
-    raw_distances = []
-
+    # Scoring and Reranking
+    scored_items = []
     for item in raw_results:
         metadata = item.get("metadata") or {}
-        raw_snippet = (metadata.get("chunk_text") or "").strip()
-        distance = item.get("distance")
+        snippet = metadata.get("chunk_text") or ""
 
-        raw_distances.append(distance)
+        # Calculate scores
+        lex_score = get_lexical_score(query, snippet)
+        distance = item.get("distance") or 1.0  # Assume 1.0 if missing (max distance)
 
-        if not raw_snippet:
-            continue
+        # Combine: Lower cosine distance is better, higher lexical is better
+        # Invert distance (1-d) to get 'vector similarity'
+        combined_score = (1.0 - distance) + (lex_score * 0.5)
 
-        if max_distance is not None and isinstance(distance, (int, float)) and distance > max_distance:
-            continue
+        scored_items.append({
+            "score": combined_score,
+            "item": item,
+            "doc_id": metadata.get("source_path") or metadata.get("title") or "unknown"
+        })
 
-        normalized = " ".join(raw_snippet.split()).lower()
-        if normalized in seen_snippets:
-            continue
-        seen_snippets.add(normalized)
+    # Sort by the new combined score (highest first)
+    scored_items.sort(key=lambda x: x["score"], reverse=True)
 
-        sources.append(
-            SourceItem(
-                id=item.get("key") or str(uuid.uuid4()),
-                title=metadata.get("title"),
-                source_path=metadata.get("source_path"),
-                snippet=shorten_snippet(raw_snippet),
-                doc_type=metadata.get("doc_type"),
-                chunk_index=metadata.get("chunk_index"),
-                distance=distance if isinstance(distance, (int, float)) else None,
+    # Diversification Filter
+    final_sources: List[SourceItem] = []
+    doc_counts = {}
+    dropped_by_diversity = 0
+
+    for entry in scored_items:
+        if len(final_sources) >= return_n:
+            break
+
+        doc_id = entry["doc_id"]
+        count = doc_counts.get(doc_id, 0)
+
+        # Only add if the per-document limit isn't exceeded
+        if count < MAX_CHUNKS_PER_DOC:
+            doc_counts[doc_id] = count + 1
+            item = entry["item"]
+            metadata = item.get("metadata") or {}
+            final_sources.append(
+                SourceItem(
+                    id=item.get("key") or str(uuid.uuid4()),
+                    title=metadata.get("title"),
+                    source_path=metadata.get("source_path"),
+                    snippet=shorten_snippet(metadata.get("chunk_text", "")),
+                    doc_type=metadata.get("doc_type"),
+                    chunk_index=metadata.get("chunk_index"),
+                    distance=item.get("distance"),
+                )
             )
-        )
+        else:
+            dropped_by_diversity += 1
 
     logger.info(
-        "retrieval query=%r raw_hits=%s used_hits=%s distances=%s",
-        query,
-        len(raw_results),
-        len(sources),
-        raw_distances,
+        f"Retrieval complete: final_count={len(final_sources)}, "
+        f"dropped_by_diversity={dropped_by_diversity}, "
+        f"docs_represented={len(doc_counts)}"
     )
 
-    return sources
+    return final_sources
 
 def shorten_snippet(text: str, max_chars: int = SOURCE_SNIPPET_CHARS) -> str:
     """
