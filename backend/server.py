@@ -76,6 +76,9 @@ MAX_RETRIEVAL_DISTANCE = os.getenv("MAX_RETRIEVAL_DISTANCE", "").strip()
 SOURCE_SNIPPET_CHARS = int(os.getenv("SOURCE_SNIPPET_CHARS", "280"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+RAW_FETCH_SIZE = int(os.getenv("RAW_FETCH_SIZE", "12"))
+FINAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "4"))
+MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "2"))
 
 # Set up logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -314,6 +317,17 @@ def search_text_chunks(
 
 def is_rag_enabled() -> bool:
     return RAG_ENABLED and bool(SAGEMAKER_ENDPOINT and VECTOR_BUCKET and VECTOR_INDEX)
+
+def get_lexical_score(query: str, document: str) -> float:
+    """Returns a simple (Jaccard-style token intersection) overlap score between 0 and 1.
+        TODO : use rank_bm25 or a similar algorithm for better lexical scoring
+    """
+    query_words = set(query.lower().split())
+    doc_words = set(document.lower().split())
+    if not query_words:
+        return 0.0
+    intersection = query_words.intersection(doc_words)
+    return len(intersection) / len(query_words)
 
 def retrieve_sources(query: str, top_k: int = RETRIEVAL_TOP_K) -> List[SourceItem]:
     """
