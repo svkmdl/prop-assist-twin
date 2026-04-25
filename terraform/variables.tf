@@ -22,6 +22,12 @@ variable "bedrock_model_id" {
   default     = "eu.amazon.nova-pro-v1:0"
 }
 
+variable "bedrock_light_model_id" {
+  description = "Bedrock light model ID"
+  type        = string
+  default     = "eu.amazon.nova-micro-v1:0"
+}
+
 variable "lambda_timeout" {
   description = "Lambda function timeout in seconds"
   type        = number

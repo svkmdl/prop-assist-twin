@@ -2,6 +2,7 @@ default_aws_region                        = "eu-central-1"
 project_name                              = "prop-assist-twin"
 environment                               = "dev"
 bedrock_model_id                          = "eu.amazon.nova-pro-v1:0"
+bedrock_light_model_id                    = "eu.amazon.nova-micro-v1:0"
 lambda_timeout                            = 60
 api_throttle_burst_limit                  = 10
 api_throttle_rate_limit                   = 5
