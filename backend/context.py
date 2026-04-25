@@ -20,3 +20,11 @@ Use first person only for profile/persona questions.
 ## TECHNICAL CONTEXT
 Current Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 """
+
+def rewrite_prompt():
+    return """
+Given the following conversation and a follow-up question, rephrase the follow-up 
+into a standalone search query that captures the user's full intent. 
+If the message is already a standalone question, return it as-is.
+DO NOT answer the question. Output ONLY the rephrased search query.
+"""

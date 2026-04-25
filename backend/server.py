@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
-from context import prompt
+from context import prompt, rewrite_prompt
 
 # Load environment variables
 load_dotenv()
@@ -54,6 +54,7 @@ bedrock_client = boto3.client(
 # - amazon.nova-pro-v1:0    (most capable, higher cost)
 # you might need to add us. or eu. prefix to the below model id to get the regional inference profile
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "eu.amazon.nova-pro-v1:0")
+BEDROCK_LIGHT_MODEL_ID = os.getenv("BEDROCK_LIGHT_MODEL_ID", "eu.amazon.nova-micro-v1:0")
 
 # Memory storage configuration
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
@@ -263,6 +264,35 @@ def index_text_chunk(
     )
     return vector_id
 
+def rewrite_query(conversation: List[Dict], user_message: str) -> str:
+    """Uses LLM to turn conversational follow-ups into standalone search queries."""
+    if not conversation:
+        return user_message
+
+    # Prepare context: combine last few turns for brevity
+    context_text = ""
+    for msg in conversation[-5:]: # Only the recent context
+        context_text += f"{msg['role']}: {msg['content']}\n"
+
+    messages = [{
+        "role": "user",
+        "content": [{"text": f"CONVERSATION HISTORY:\n{context_text}\n\nFOLLOW-UP: {user_message}"}]
+    }]
+
+    try:
+        response = bedrock_client.converse(
+            modelId=BEDROCK_LIGHT_MODEL_ID,
+            system=[{"text": rewrite_prompt()}],
+            messages=messages,
+            inferenceConfig={"maxTokens": 100, "temperature": 0}
+        )
+        rewritten = response["output"]["message"]["content"][0]["text"].strip()
+        logger.info(f"Query Rewritten: '{user_message}' -> '{rewritten}'")
+        return rewritten
+    except Exception as e:
+        logger.warning(f"Query rewrite failed, falling back to original: {e}")
+        return user_message
+
 def search_text_chunks(
     query: str,
     top_k: int = 5
@@ -466,8 +496,11 @@ async def chat(request: ChatRequest):
         # Load conversation history
         conversation = load_conversation(session_id)
 
+        # Determine the search query (using history if it exists)
+        search_query = rewrite_query(conversation, request.message)
+
         # Retrieve sources
-        sources = retrieve_sources(request.message)
+        sources = retrieve_sources(search_query)
 
         # Call Bedrock for response
         assistant_response = call_bedrock(
