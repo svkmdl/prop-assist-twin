@@ -125,7 +125,7 @@ export default function Twin() {
                     <div className="text-center text-gray-500 mt-8">
                         <Bot className="w-12 h-12 mx-auto mb-3 text-gray-400" />
                         <p>Hallo! Ich bin dein KI Immobilien-Assistentin.</p>
-                        <p className="text-sm mt-2">Frag mich alles rund um Immobilien!</p>
+                        <p className="text-sm mt-2">Ask me about XYZ Immobilien’s listings, process, neighborhoods, and next steps — I answer from verified company knowledge and show my sources.</p>
                     </div>
                 )}
 
