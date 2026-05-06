@@ -195,3 +195,10 @@ variable "chunk_overlap" {
   type        = number
   default     = 200
 }
+
+variable "admin_api_key" {
+  description = "Temporary admin API key for /ingest, /embed, and /conversation. Will use real OIDC/SAML/Cognito etc for production."
+  type        = string
+  default     = ""
+  sensitive   = true
+}

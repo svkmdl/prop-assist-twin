@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
@@ -80,6 +80,9 @@ RAW_FETCH_SIZE = int(os.getenv("RAW_FETCH_SIZE", "12"))
 FINAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "4"))
 MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "2"))
 
+# ADMIN configuration
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
 # Set up logging
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -154,6 +157,18 @@ def save_conversation(session_id: str, messages: List[Dict]):
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
             json.dump(messages, f, indent=2)
+
+# Admin API functions
+def require_admin_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """Small PoC admin gate for non-browser operational endpoints.
+
+    Enterprise prod version should use OIDC/SAML/Cognito and user/tenant claims. Alternatively can use REST via API Gateway and API Key in the medium term.
+    """
+    if not ADMIN_API_KEY:
+        logger.warning("ADMIN_API_KEY is not configured; admin endpoint is open")
+        return
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 def call_bedrock(
         conversation: List[Dict],
@@ -487,11 +502,11 @@ async def health_check():
         "rag_enabled": is_rag_enabled()
     }
 
-@app.post("/embed")
+@app.post("/embed", dependencies=[Depends(require_admin_api_key)])
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=[Depends(require_admin_api_key)])
 async def ingest_file(file: UploadFile = File(...)):
     if not file.filename.endswith(".md"):
         raise HTTPException(status_code=400, detail="Only .md files are supported")
@@ -575,7 +590,7 @@ async def chat(request: ChatRequest):
         print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/conversation/{session_id}")
+@app.get("/conversation/{session_id}", dependencies=[Depends(require_admin_api_key)])
 async def get_conversation(session_id: str):
     """Retrieve conversation history"""
     try:

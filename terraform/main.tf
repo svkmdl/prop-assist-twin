@@ -268,6 +268,7 @@ resource "aws_lambda_function" "api" {
       SOURCE_SNIPPET_CHARS   = tostring(var.source_snippet_chars)
       CHUNK_SIZE             = tostring(var.chunk_size)
       CHUNK_OVERLAP          = tostring(var.chunk_overlap)
+      ADMIN_API_KEY          = var.admin_api_key
     }
   }
 
