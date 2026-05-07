@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
 import logging
+import re
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 import json
@@ -83,6 +84,10 @@ MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "2"))
 # ADMIN configuration
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
+# Request Configuration
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "3000"))
+SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
 # Set up logging
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -93,8 +98,12 @@ if USE_S3:
 
 # Request/Response models
 class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
+    session_id: Optional[str] = Field(
+        default=None,
+        pattern=SESSION_ID_PATTERN,
+        max_length=64
+    )
 
 class SourceItem(BaseModel):
     id: str
@@ -118,11 +127,12 @@ class Message(BaseModel):
 
 # Embedding model
 class EmbedRequest(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
-    return f"{session_id}.json"
+    safe_session_id = normalize_session_id(session_id)
+    return f"{safe_session_id}.json"
 
 def load_conversation(session_id: str) -> List[Dict]:
     """Load conversation history from storage"""
@@ -157,6 +167,11 @@ def save_conversation(session_id: str, messages: List[Dict]):
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
             json.dump(messages, f, indent=2)
+
+def normalize_session_id(session_id: str) -> str:
+    if not re.fullmatch(SESSION_ID_PATTERN, session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+    return session_id
 
 # Admin API functions
 def require_admin_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:

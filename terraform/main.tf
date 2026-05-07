@@ -269,6 +269,7 @@ resource "aws_lambda_function" "api" {
       CHUNK_SIZE             = tostring(var.chunk_size)
       CHUNK_OVERLAP          = tostring(var.chunk_overlap)
       ADMIN_API_KEY          = var.admin_api_key
+      MAX_MESSAGE_CHARS      = tostring(var.max_message_chars)
     }
   }
 

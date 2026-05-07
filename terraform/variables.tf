@@ -202,3 +202,9 @@ variable "admin_api_key" {
   default     = ""
   sensitive   = true
 }
+
+variable "max_message_chars" {
+  description = "Maximum user message length accepted by the backend"
+  type        = number
+  default     = 3000
+}
