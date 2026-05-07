@@ -132,7 +132,7 @@ class EmbedRequest(BaseModel):
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
     safe_session_id = normalize_session_id(session_id)
-    return f"{safe_session_id}.json"
+    return f"sessions/{safe_session_id}.json"
 
 def load_conversation(session_id: str) -> List[Dict]:
     """Load conversation history from storage"""
@@ -147,6 +147,7 @@ def load_conversation(session_id: str) -> List[Dict]:
     else:
         # Local file storage
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 return json.load(f)
