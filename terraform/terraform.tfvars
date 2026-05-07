@@ -28,3 +28,4 @@ source_snippet_chars                      = 200
 chunk_size                                = 1500
 chunk_overlap                             = 200
 admin_api_key                             = "CHANGE_ME"
+max_message_chars                         = 3000
