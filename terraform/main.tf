@@ -262,7 +262,7 @@ resource "aws_lambda_function" "api" {
       VECTOR_INDEX           = try(aws_s3vectors_index.rag[0].index_name, "")
       DEFAULT_AWS_REGION     = var.default_aws_region
       RAG_ENABLED            = tostring(var.rag_enabled)
-      RETRIEVAL_TOP_K        = tostring(var.retrieval_top_k)
+      FINAL_TOP_K            = tostring(var.final_top_k)
       LOG_LEVEL              = var.log_level
       MAX_RETRIEVAL_DISTANCE = var.max_retrieval_distance
       SOURCE_SNIPPET_CHARS   = tostring(var.source_snippet_chars)

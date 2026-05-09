@@ -72,14 +72,13 @@ VECTOR_INDEX = os.getenv("VECTOR_INDEX", "")
 
 # RAG configuration
 RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
-RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_RETRIEVAL_DISTANCE = os.getenv("MAX_RETRIEVAL_DISTANCE", "").strip()
 SOURCE_SNIPPET_CHARS = int(os.getenv("SOURCE_SNIPPET_CHARS", "280"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 RAW_FETCH_SIZE = int(os.getenv("RAW_FETCH_SIZE", "12"))
-FINAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "4"))
+FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "3"))
 MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "2"))
 
 # ADMIN configuration

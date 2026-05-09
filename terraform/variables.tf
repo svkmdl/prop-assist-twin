@@ -135,13 +135,13 @@ variable "rag_enabled" {
   default     = true
 }
 
-variable "retrieval_top_k" {
-  description = "How many vector search results to retrieve for RAG"
+variable "final_top_k" {
+  description = "How many vector search results to consider for RAG"
   type        = number
   default     = 3
 
   validation {
-    condition     = var.retrieval_top_k > 0
+    condition     = var.final_top_k > 0
     error_message = "retrieval_top_k must be greater than 0."
   }
 }

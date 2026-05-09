@@ -21,7 +21,7 @@ s3vectors_non_filterable_metadata_keys = [
   "chunk_text"
 ]
 rag_enabled                               = true
-retrieval_top_k                           = 3
+final_top_k                               = 3
 log_level                                 = "INFO"
 max_retrieval_distance                    = 0.5
 source_snippet_chars                      = 200
