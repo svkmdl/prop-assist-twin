@@ -208,3 +208,9 @@ variable "max_message_chars" {
   type        = number
   default     = 3000
 }
+
+variable "max_upload_bytes" {
+  description = "Maximum markdown ingestion upload size"
+  type        = number
+  default     = 1048576
+}

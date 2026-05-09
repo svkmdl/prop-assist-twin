@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 import os
 import logging
 import re
+from pathlib import Path
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 import json
@@ -87,6 +88,10 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 # Request Configuration
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "3000"))
 SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
+# Ingestion file configuration
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
+SAFE_MD_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+\.md$")
 
 # Set up logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -524,21 +529,28 @@ async def embed(request: EmbedRequest):
 
 @app.post("/ingest", dependencies=[Depends(require_admin_api_key)])
 async def ingest_file(file: UploadFile = File(...)):
-    if not file.filename.endswith(".md"):
-        raise HTTPException(status_code=400, detail="Only .md files are supported")
+    filename = Path(file.filename or "").name
+    if not SAFE_MD_FILENAME_PATTERN.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="Only safe .md filenames are supported")
 
     try:
+        content_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File uploaded too large")
 
-        content = (await file.read()).decode("utf-8")
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="File must be UTF-8 text")
 
         chunks_processed = 0
         for count, chunk in enumerate(chunk_text(content)):
 
-            vector_id = f"{file.filename}_{count}"
+            vector_id = f"{filename}_{count}"
 
             metadata = {
-                "source_path": f"api_upload/{file.filename}",
-                "title": file.filename.rsplit('.', 1)[0],
+                "source_path": f"api_upload/{filename}",
+                "title": filename.rsplit('.', 1)[0],
                 "doc_type": ".md",
                 "chunk_index": count
             }
@@ -547,10 +559,12 @@ async def ingest_file(file: UploadFile = File(...)):
             chunks_processed += 1
 
         return {
-            "filename": file.filename,
+            "filename": filename,
             "chunks_indexed": chunks_processed,
             "status": "success"
         }
+    except HTTPException:
+        raise
 
     except Exception as e:
         logger.error(f"Ingestion failed: {str(e)}")
