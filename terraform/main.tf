@@ -7,6 +7,13 @@ locals {
     "www.${var.root_domain}"
   ] : []
 
+  api_allowed_origins = var.use_custom_domain && var.root_domain != "" ? [
+    "https://${var.root_domain}",
+    "https://www.${var.root_domain}"
+  ] : [
+    "https://${aws_cloudfront_distribution.main.domain_name}"
+  ]
+
   name_prefix = "${var.project_name}-${var.environment}"
 
   common_tags = {
@@ -138,19 +145,52 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_bedrock" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"
-  role       = aws_iam_role.lambda_role.name
-}
+resource "aws_iam_role_policy" "lambda_app_policy" {
+  name = "${local.name_prefix}-lambda-app-policy"
+  role = aws_iam_role.lambda_role.id
 
-resource "aws_iam_role_policy_attachment" "lambda_s3" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-  role       = aws_iam_role.lambda_role.name
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_sagemaker" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
-  role       = aws_iam_role.lambda_role.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Sid    = "ConversationMemoryObjectAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "${aws_s3_bucket.memory.arn}/sessions/*"
+      },
+      {
+        Sid      = "ConversationMemoryList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.memory.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["sessions/*"]
+          }
+        }
+      },
+      {
+        Sid    = "BedrockRuntimeInvoke"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = "*"
+      }
+      ], var.sagemaker_embedding_enabled ? [
+      {
+        Sid      = "InvokeEmbeddingEndpoint"
+        Effect   = "Allow"
+        Action   = ["sagemaker:InvokeEndpoint"]
+        Resource = "arn:aws:sagemaker:${var.default_aws_region}:${data.aws_caller_identity.current.account_id}:endpoint/${aws_sagemaker_endpoint.embedding_endpoint[0].name}"
+      }
+    ] : [])
+  })
 }
 
 resource "aws_iam_role" "sagemaker_role" {
@@ -189,8 +229,6 @@ resource "aws_iam_role_policy" "lambda_s3vectors" {
         Effect = "Allow"
         Action = [
           "s3vectors:PutVectors",
-          "s3vectors:GetVectors",
-          "s3vectors:DeleteVectors",
           "s3vectors:QueryVectors"
         ]
         Resource = [
@@ -252,7 +290,7 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      CORS_ORIGINS           = var.use_custom_domain ? "https://${var.root_domain},https://www.${var.root_domain}" : "https://${aws_cloudfront_distribution.main.domain_name}"
+      CORS_ORIGINS           = join(",", local.api_allowed_origins)
       S3_BUCKET              = aws_s3_bucket.memory.id
       USE_S3                 = "true"
       BEDROCK_MODEL_ID       = var.bedrock_model_id
@@ -289,9 +327,9 @@ resource "aws_apigatewayv2_api" "main" {
 
   cors_configuration {
     allow_credentials = false
-    allow_headers     = ["*"]
+    allow_headers     = ["content-type", "x-api-key"]
     allow_methods     = ["GET", "POST", "OPTIONS"]
-    allow_origins     = ["*"]
+    allow_origins     = local.api_allowed_origins
     max_age           = 300
   }
 }
@@ -383,7 +421,7 @@ resource "aws_cloudfront_distribution" "main" {
   tags                = local.common_tags
 
   default_cache_behavior {
-    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${aws_s3_bucket.frontend.id}"
 
