@@ -74,7 +74,9 @@ VECTOR_INDEX = os.getenv("VECTOR_INDEX", "")
 RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_RETRIEVAL_DISTANCE = os.getenv("MAX_RETRIEVAL_DISTANCE", "").strip()
+MAX_RETRIEVAL_DISTANCE_VALUE = float(MAX_RETRIEVAL_DISTANCE) if MAX_RETRIEVAL_DISTANCE else None
 SOURCE_SNIPPET_CHARS = int(os.getenv("SOURCE_SNIPPET_CHARS", "280"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "1500"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 RAW_FETCH_SIZE = int(os.getenv("RAW_FETCH_SIZE", "12"))
@@ -114,6 +116,7 @@ class SourceItem(BaseModel):
     title: Optional[str] = None
     source_path: Optional[str] = None
     snippet: str
+    context: Optional[str] = Field(default=None, exclude=True) # Internal model context, excluded from API response
     doc_type: Optional[str] = None
     chunk_index: Optional[int] = None
     distance: Optional[float] = None
@@ -391,15 +394,23 @@ def retrieve_sources(
     scored_items = []
     for item in raw_results:
         metadata = item.get("metadata") or {}
-        snippet = metadata.get("chunk_text") or ""
+        chunk_body = metadata.get("chunk_text") or ""
+        distance = item.get("distance")
+
+        if (
+                MAX_RETRIEVAL_DISTANCE_VALUE is not None
+                and distance is not None
+                and distance > MAX_RETRIEVAL_DISTANCE_VALUE
+        ):
+            continue
 
         # Calculate scores
-        lex_score = get_lexical_score(query, snippet)
-        distance = item.get("distance") or 1.0  # Assume 1.0 if missing (max distance)
+        lex_score = get_lexical_score(query, chunk_body)
+        distance_for_score = distance if distance is not None else 1.0  # Assume 1.0 if missing (max distance)
 
         # Combine: Lower cosine distance is better, higher lexical is better
         # Invert distance (1-d) to get 'vector similarity'
-        combined_score = (1.0 - distance) + (lex_score * 0.5)
+        combined_score = (1.0 - distance_for_score) + (lex_score * 0.5)
 
         scored_items.append({
             "score": combined_score,
@@ -427,12 +438,14 @@ def retrieve_sources(
             doc_counts[doc_id] = count + 1
             item = entry["item"]
             metadata = item.get("metadata") or {}
+            chunk_body = metadata.get("chunk_text", "")
             final_sources.append(
                 SourceItem(
                     id=item.get("key") or str(uuid.uuid4()),
                     title=metadata.get("title"),
                     source_path=metadata.get("source_path"),
-                    snippet=shorten_snippet(metadata.get("chunk_text", "")),
+                    snippet=shorten_snippet(chunk_body),
+                    context=shorten_snippet(chunk_body, MAX_CONTEXT_CHARS),
                     doc_type=metadata.get("doc_type"),
                     chunk_index=metadata.get("chunk_index"),
                     distance=item.get("distance"),
@@ -498,7 +511,7 @@ def build_retrieval_block(sources: List[SourceItem]) -> str:
         if source.source_path:
             lines.append(f"Path: {source.source_path}")
 
-        lines.append(source.snippet)
+        lines.append(source.context or source.snippet)
 
     return "\n".join(lines)
 

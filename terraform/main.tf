@@ -263,6 +263,9 @@ resource "aws_lambda_function" "api" {
       DEFAULT_AWS_REGION     = var.default_aws_region
       RAG_ENABLED            = tostring(var.rag_enabled)
       FINAL_TOP_K            = tostring(var.final_top_k)
+      RAW_FETCH_SIZE         = tostring(var.raw_fetch_size)
+      MAX_CHUNKS_PER_DOC     = tostring(var.max_chunks_per_doc)
+      MAX_CONTEXT_CHARS      = tostring(var.max_context_chars)
       LOG_LEVEL              = var.log_level
       MAX_RETRIEVAL_DISTANCE = var.max_retrieval_distance
       SOURCE_SNIPPET_CHARS   = tostring(var.source_snippet_chars)

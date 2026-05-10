@@ -142,7 +142,7 @@ variable "final_top_k" {
 
   validation {
     condition     = var.final_top_k > 0
-    error_message = "retrieval_top_k must be greater than 0."
+    error_message = "final_top_k must be greater than 0."
   }
 }
 
@@ -213,4 +213,22 @@ variable "max_upload_bytes" {
   description = "Maximum markdown ingestion upload size"
   type        = number
   default     = 1048576
+}
+
+variable "raw_fetch_size" {
+  description = "Number of raw vector candidates fetched before reranking"
+  type        = number
+  default     = 12
+}
+
+variable "max_chunks_per_doc" {
+  description = "Maximum source chunks selected from one document"
+  type        = number
+  default     = 2
+}
+
+variable "max_context_chars" {
+  description = "Maximum retrieved context characters passed to the answer model per source"
+  type        = number
+  default     = 1500
 }
