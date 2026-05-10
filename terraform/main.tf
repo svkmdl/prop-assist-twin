@@ -229,6 +229,7 @@ resource "aws_iam_role_policy" "lambda_s3vectors" {
         Effect = "Allow"
         Action = [
           "s3vectors:PutVectors",
+          "s3vectors:GetVectors",
           "s3vectors:QueryVectors"
         ]
         Resource = [
