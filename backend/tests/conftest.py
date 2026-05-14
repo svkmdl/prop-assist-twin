@@ -33,6 +33,7 @@ def server_module(monkeypatch, tmp_path):
     monkeypatch.setenv("VECTOR_BUCKET", "")
     monkeypatch.setenv("VECTOR_INDEX", "")
     monkeypatch.setenv("RAG_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_DEV", "true")
 
     monkeypatch.setattr(boto3, "client", _fake_boto3_client)
 

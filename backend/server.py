@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
 import logging
 import re
+import hmac
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
@@ -85,6 +86,7 @@ MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "2"))
 
 # ADMIN configuration
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+LOCAL_DEV = os.getenv("LOCAL_DEV", "false").lower() == "true"
 
 # Request Configuration
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "3000"))
@@ -188,10 +190,12 @@ def require_admin_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
     Enterprise prod version should use OIDC/SAML/Cognito and user/tenant claims. Alternatively can use REST via API Gateway and API Key in the medium term.
     """
     if not ADMIN_API_KEY:
-        logger.warning("ADMIN_API_KEY is not configured; admin endpoint is open")
-        return
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        if LOCAL_DEV:
+            logger.warning("ADMIN_API_KEY is not configured; admin endpoint is open because LOCAL_DEV=true")
+            return
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin API key not configured")
+    if not x_api_key or not hmac.compare_digest(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
 
 def call_bedrock(
         conversation: List[Dict],
