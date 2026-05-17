@@ -101,9 +101,9 @@ variable "s3vectors_index_name" {
 }
 
 variable "s3vectors_dimension" {
-   description = "Embedding dimension of the vector index in S3 Vectors"
-   type        = number
-   default     = 384
+  description = "Embedding dimension of the vector index in S3 Vectors"
+  type        = number
+  default     = 384
 }
 
 variable "s3vectors_distance_metric" {
@@ -112,7 +112,7 @@ variable "s3vectors_distance_metric" {
   default     = "cosine"
 
   validation {
-    condition = contains(["cosine","euclidean"], var.s3vectors_distance_metric)
+    condition     = contains(["cosine", "euclidean"], var.s3vectors_distance_metric)
     error_message = "s3vectors_distance_metric must be either 'cosine' or 'euclidean'."
   }
 }
@@ -146,14 +146,14 @@ variable "final_top_k" {
   }
 }
 
-variable "log_level"{
+variable "log_level" {
   description = "Backend log level"
   type        = string
   default     = "INFO"
 
   validation {
-      condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], upper(var.log_level))
-      error_message = "log_level must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], upper(var.log_level))
+    error_message = "log_level must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
   }
 }
 
@@ -179,15 +179,15 @@ variable "source_snippet_chars" {
   }
 }
 
-variable "chunk_size"{
-   description = "The number of characters in each chunk when splitting documents for RAG."
-   type        = number
-   default     = 1500
+variable "chunk_size" {
+  description = "The number of characters in each chunk when splitting documents for RAG."
+  type        = number
+  default     = 1500
 
-   validation {
-     condition     = var.chunk_size > 0
-     error_message = "The chunk_size must be a positive integer."
-   }
+  validation {
+    condition     = var.chunk_size > 0
+    error_message = "The chunk_size must be a positive integer."
+  }
 }
 
 variable "chunk_overlap" {

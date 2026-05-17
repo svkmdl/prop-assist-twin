@@ -10,7 +10,7 @@ locals {
   api_allowed_origins = var.use_custom_domain && var.root_domain != "" ? [
     "https://${var.root_domain}",
     "https://www.${var.root_domain}"
-  ] : [
+    ] : [
     "https://${aws_cloudfront_distribution.main.domain_name}"
   ]
 
@@ -60,7 +60,7 @@ resource "aws_s3vectors_vector_bucket" "rag" {
 }
 
 resource "aws_s3vectors_index" "rag" {
-  count              = var.s3vectors_enabled ? 1 : 0
+  count = var.s3vectors_enabled ? 1 : 0
 
   data_type          = "float32"
   dimension          = var.s3vectors_dimension
@@ -221,7 +221,7 @@ resource "aws_iam_role_policy_attachment" "sagemaker_full_access" {
 resource "aws_iam_role_policy" "lambda_s3vectors" {
   count = var.s3vectors_enabled ? 1 : 0
   name  = "${local.name_prefix}-lambda-s3vectors"
-  role   = aws_iam_role.lambda_role.id
+  role  = aws_iam_role.lambda_role.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -247,11 +247,11 @@ resource "aws_sagemaker_model" "embedding_model" {
   execution_role_arn = aws_iam_role.sagemaker_role[0].arn
 
   primary_container {
-      image = var.sagemaker_embedding_image_uri
-      environment = {
+    image = var.sagemaker_embedding_image_uri
+    environment = {
       HF_MODEL_ID = var.sagemaker_embedding_model_name
       HF_TASK     = "feature-extraction"
-      }
+    }
   }
 
   depends_on = [aws_iam_role_policy_attachment.sagemaker_full_access]
@@ -262,12 +262,12 @@ resource "aws_sagemaker_endpoint_configuration" "embedding_endpoint_config" {
   name  = "${local.name_prefix}-embedding-endpoint-config"
 
   production_variants {
-      model_name             = aws_sagemaker_model.embedding_model[0].name
+    model_name = aws_sagemaker_model.embedding_model[0].name
 
-      serverless_config {
-          memory_size_in_mb = var.sagemaker_embedding_serverless_memory_mb
-          max_concurrency   = var.sagemaker_embedding_max_concurrency
-      }
+    serverless_config {
+      memory_size_in_mb = var.sagemaker_embedding_serverless_memory_mb
+      max_concurrency   = var.sagemaker_embedding_max_concurrency
+    }
   }
 }
 
