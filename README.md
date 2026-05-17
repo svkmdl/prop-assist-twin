@@ -286,6 +286,24 @@ curl -X POST http://localhost:8000/ingest \
   -F "file=@docs/sample.md"
 ```
 
+### AI smoke evals
+
+After starting the backend locally, run a small behavioral regression suite:
+
+```bash
+cd backend
+python eval_chat.py
+```
+
+Against a deployed API:
+
+```bash
+cd backend
+API_URL="https://<api-id>.execute-api.eu-central-1.amazonaws.com" python eval_chat.py
+```
+
+The evals intentionally check behavior that matters for an enterprise assistant: language adherence, identity consistency, no invented prices, and source/citation discipline.
+
 * * *
 
 ## Environment variables
