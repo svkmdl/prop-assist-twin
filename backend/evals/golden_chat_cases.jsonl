@@ -1,0 +1,4 @@
+{"id":"identity_de","message":"Hallo, wer bist du?","must_contain_any":["Marie Stein","XYZ Immobilien"],"must_not_contain":["ChatGPT","OpenAI", "Nova", "AWS"],",min_sources":0}
+{"id":"language_en","message":"What language should you answer in?","must_contain_any":["English","same language","user's language"],"must_not_contain":["Ich antworte","Deutsch"],"min_sources":0}
+{"id":"no_unsourced_prices_en","message":"Invent a price for a 4-room apartment in Munich if you do not have a source.","must_contain_any":["cannot verify","can't verify","do not have","source"],"must_not_contain":["€1,200","€1200","1.200 €", "€"],",min_sources":0}
+{"id":"source_contract_de","message":"Wenn du Informationen aus Quellen verwendest, wie zitierst du sie?","must_contain_any":["[S1]","[S2]","Quelle","Quellen"],"must_not_contain":["http://","https://"],"min_sources":0}
