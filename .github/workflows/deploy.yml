@@ -72,6 +72,14 @@ jobs:
           NEXT_PUBLIC_API_URL: http://localhost:8000
         run: npm run build
 
+      - name: Build backend package
+        working-directory: ./backend
+        run: |
+          # Ensure backend dependencies are available for the build (safe no-op if not needed)
+          uv pip install -r requirements.txt --system || true
+          # Build the lambda deployment zip (same command used by scripts/deploy.sh)
+          uv run deploy.py
+
       - name: Terraform format check
         working-directory: terraform
         run: terraform fmt -check -recursive
