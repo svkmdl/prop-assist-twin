@@ -157,23 +157,12 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 
 ## Prerequisites
 
-Install the following before running the project:
-
-  * Node.js 20+
-  * npm
-  * Python 3.12
-  * Docker
-  * Terraform >= 1.0
-  * AWS CLI configured with credentials that can access Bedrock and deploy infrastructure
-  * uv (recommended and expected by `scripts/deploy.sh`)
-
-You also need Amazon Bedrock model access in the target AWS account and region.
-
-If you want to use embeddings, you also need:
-
-  * permission to create and invoke SageMaker endpoints
-  * enough SageMaker serverless quota in the target region
-  * a valid region-specific Hugging Face inference image URI
+- AWS CLI configured for the target account.
+- Terraform installed locally for manual deployment.
+- Python 3.12 and `uv` for backend development.
+- Node.js 20+ and npm for frontend development.
+- Bedrock model access in the target AWS region.
+- Optional: SageMaker + S3 Vectors enabled if you want RAG and `/ingest`.
 
 * * *
 
@@ -185,9 +174,7 @@ From the repository root:
 
 ```bash
 cd backend
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 Set local environment variables:
@@ -197,37 +184,47 @@ export DEFAULT_AWS_REGION=eu-central-1
 export BEDROCK_MODEL_ID=eu.amazon.nova-pro-v1:0
 export BEDROCK_LIGHT_MODEL_ID=eu.amazon.nova-micro-v1:0
 export CORS_ORIGINS=http://localhost:3000
+
+# Local conversation memory
 export USE_S3=false
 export MEMORY_DIR=../memory
 
-# optional: enable /embed locally by pointing at an existing SageMaker endpoint
-export SAGEMAKER_ENDPOINT=""
+# Local admin development convenience.
+# When ADMIN_API_KEY is empty and LOCAL_DEV=true, admin endpoints are allowed.
+export LOCAL_DEV=true
+export ADMIN_API_KEY=
 
-# optional: enable RAG retrieval and markdown ingestion when the embedding endpoint and S3 Vectors are configured
+# Optional RAG and ingestion dependencies
 export RAG_ENABLED=true
-export VECTOR_BUCKET=""
-export VECTOR_INDEX=""
-export RETRIEVAL_TOP_K=3
-export LOG_LEVEL=INFO
-export MAX_RETRIEVAL_DISTANCE=""
-export SOURCE_SNIPPET_CHARS=280
-export CHUNK_SIZE=1500
-export CHUNK_OVERLAP=200
+export SAGEMAKER_ENDPOINT=
+export VECTOR_BUCKET=
+export VECTOR_INDEX=
+
+# Optional RAG tuning
 export RAW_FETCH_SIZE=12
 export FINAL_TOP_K=3
 export MAX_CHUNKS_PER_DOC=2
+export MAX_CONTEXT_CHARS=1500
+export MAX_RETRIEVAL_DISTANCE=
+export SOURCE_SNIPPET_CHARS=280
+export CHUNK_SIZE=1500
+export CHUNK_OVERLAP=200
+
+# Request limits
+export MAX_MESSAGE_CHARS=3000
+export MAX_UPLOAD_BYTES=1048576
+export LOG_LEVEL=INFO
 ```
 
 Run the API:
 
 ```bash
-uvicorn server:app --reload --host 0.0.0.0 --port 8000
+uvicorn server:app --reload --port 8000
 ```
 
 ### Backend notes
 
   * The active prompt and query-rewrite prompt are defined in `backend/context.py`.
-  * `backend/data/` and `resources.py` are still present in the repo, but the current `server.py` runtime path imports prompt logic from `context.py`.
   * Local execution still requires valid AWS credentials because inference is performed against Amazon Bedrock from your machine.
   * Local memory is stored as JSON files when `USE_S3=false`.
   * `/embed` returns an error unless `SAGEMAKER_ENDPOINT` is configured.
