@@ -83,49 +83,34 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 
 ```text
 .
+├── .github/workflows/deploy.yml      # GitHub Actions deployment pipeline
 ├── backend/
-│   ├── data/
-│   │   ├── facts.json
-│   │   ├── linkedin.pdf
-│   │   ├── style.txt
-│   │   └── summary.txt
-│   ├── .python-version
-│   ├── context.py
-│   ├── deploy.py
-│   ├── index-kb.py
-│   ├── lambda_handler.py
-│   ├── me.txt
+│   ├── data/kb/                      # Markdown knowledge base for ingestion
+│   │   ├── areas.md
+│   │   ├── buying_process.md
+│   │   ├── company_faq.md
+│   │   ├── property-listings.md
+│   │   └── service_areas.md
+│   ├── evals/golden_chat_cases.jsonl # Golden cases for AI smoke evaluation
+│   ├── tests/                        # Pytest coverage for API and retrieval helpers
+│   ├── context.py                    # Persona, grounding, and query rewrite prompts
+│   ├── deploy.py                     # Lambda package builder
+│   ├── eval_chat.py                  # Chat evaluation runner
+│   ├── lambda_handler.py             # Mangum Lambda entrypoint
+│   ├── server.py                     # FastAPI app, RAG, ingestion, chat, memory
 │   ├── pyproject.toml
 │   ├── requirements.txt
-│   ├── resources.py
-│   ├── server.py
 │   └── uv.lock
 ├── frontend/
 │   ├── app/
-│   │   ├── globals.css
-│   │   ├── layout.tsx
-│   │   └── page.tsx
-│   ├── components/
-│   │   └── twin.tsx
-│   ├── public/
-│   ├── README.md
-│   ├── eslint.config.mjs
-│   ├── next.config.ts
-│   ├── package-lock.json
-│   ├── package.json
-│   ├── postcss.config.mjs
-│   └── tsconfig.json
+│   ├── components/twin.tsx           # Browser chat UI and source rendering
+│   ├── next.config.ts                # Static export configuration
+│   └── package.json
 ├── scripts/
-│   ├── deploy.sh
-│   └── destroy.sh
-├── terraform/
-│   ├── backend.tf
-│   ├── main.tf
-│   ├── outputs.tf
-│   ├── terraform.tfvars
-│   ├── variables.tf
-│   └── versions.tf
-└── .github/workflows/deploy.yml
+│   ├── deploy.sh                     # Build, Terraform apply, frontend sync
+│   └── destroy.sh                    # Empty buckets and Terraform destroy
+├── terraform/                        # AWS infrastructure
+└── README.md
 ```
 
 * * *
