@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+LAMBDA_PKG_DIR = BACKEND_DIR / "lambda-package"
 
 # Create a blank object to act as a fake AWS client.
 # This prevents tests from attempting to connect to real AWS services.
@@ -21,6 +22,7 @@ def _fake_boto3_client(*args, **kwargs):
 def server_module(monkeypatch, tmp_path):
     monkeypatch.chdir(BACKEND_DIR)
     monkeypatch.syspath_prepend(str(BACKEND_DIR))
+    monkeypatch.syspath_prepend(str(LAMBDA_PKG_DIR))
 
     # Force the application into a local testing state.
     # We disable S3 and EC2 metadata to avoid timeouts and costs during tests.

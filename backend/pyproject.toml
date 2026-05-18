@@ -13,3 +13,7 @@ dependencies = [
     "pytest>=9.0.0",
     "httpx>=0.28.1"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["lambda-package", ".venv", ".git"]
