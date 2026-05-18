@@ -19,6 +19,9 @@ def main():
     # Install dependencies using Docker with Lambda runtime image
     print("Installing dependencies for Lambda runtime...")
 
+    uid = os.getuid()
+    gid = os.getgid()
+
     # Use the official AWS Lambda Python 3.12 image
     # This ensures compatibility with Lambda's runtime environment
     subprocess.run(
@@ -26,6 +29,8 @@ def main():
             "docker",
             "run",
             "--rm",
+            "--user",
+            f"{uid}:{gid}",
             "-v",
             f"{os.getcwd()}:/var/task",
             "--platform",
