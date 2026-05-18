@@ -10,31 +10,18 @@ Technical README for running and deploying the project.
 
 ```mermaid
 flowchart LR
-    U[End user browser]
-    R53[Route 53<br/>optional custom domain]
-    ACM[ACM certificate<br/>us-east-1 for CloudFront]
-    CF[CloudFront]
-    S3F[S3 frontend bucket<br/>Next.js static export]
-    API[API Gateway<br/>HTTP API]
-    L[Lambda<br/>Python 3.12<br/>FastAPI + Mangum]
-    BR[Amazon Bedrock Runtime<br/>Nova model]
-    SM[Amazon SageMaker Endpoint<br/>optional embeddings]
-    S3M[S3 memory bucket<br/>session transcripts]
-    V[S3 Vectors<br/>optional RAG index]
-    P[Prompt + rewrite config<br/>backend/context.py]
-
-    R53 --> CF
-    ACM -. TLS for custom domain .-> CF
-    U --> CF
-    CF --> S3F
-    U --> API
-    API --> L
-    L --> BR
-    L -. /embed when configured .-> SM
-    L --> S3M
-    L -. RAG search when configured .-> V
-    P -. prompt + query rewrite .-> L
+  User[Browser user] --> CF[CloudFront]
+  CF --> S3FE[S3 static frontend]
+  User --> APIGW[API Gateway HTTP API]
+  APIGW --> Lambda[FastAPI Lambda via Mangum]
+  Lambda --> Bedrock[Amazon Bedrock Nova]
+  Lambda --> Memory[(Conversation memory: S3 or local JSON)]
+  Lambda --> SageMaker[SageMaker embedding endpoint]
+  Lambda --> S3Vectors[S3 Vectors index]
+  Admin[Admin ingestion client] --> APIGW
 ```
+
+The frontend is statically exported by Next.js and served from S3 behind CloudFront. The browser calls the API Gateway URL directly. API Gateway invokes a Python Lambda package that hosts the FastAPI app through Mangum.
 
 ### AWS components
 
@@ -49,6 +36,46 @@ flowchart LR
   * Route 53 + ACM are optional and only used when a custom domain is enabled.
 
 > `backend/server.py` now exposes `/ingest` for markdown ingestion and uses S3 Vectors-backed retrieval inside `/chat` when RAG is configured. Terraform can provision an S3 Vectors bucket and index and pass their names to Lambda as `VECTOR_BUCKET` and `VECTOR_INDEX` when `s3vectors_enabled = true`.
+
+---
+
+## RAG flow
+
+```mermaid
+flowchart TD
+  U[User in Next.js chat widget] --> FE[Frontend sends POST /chat]
+  FE --> API[FastAPI Lambda]
+  API --> MEM[Load session memory]
+  MEM --> HIST{Conversation history exists?}
+  HIST -- yes --> RW[Bedrock light model rewrites follow-up into standalone query]
+  HIST -- no --> Q[Use user message as search query]
+  RW --> Q
+  Q --> RAG{RAG enabled and dependencies configured?}
+  RAG -- no --> BASE[Base prompt from backend/context.py]
+  RAG -- yes --> EMB[Embed query with SageMaker endpoint]
+  EMB --> VEC[Query S3 Vectors for RAW_FETCH_SIZE candidates]
+  VEC --> RERANK[Apply distance cutoff, lexical rerank, and per-document cap]
+  RERANK --> SRC[Select FINAL_TOP_K source snippets]
+  SRC --> BLOCK[Append RETRIEVED KNOWLEDGE block with S1/S2 citation rules]
+  BASE --> ANSWER[Bedrock Nova final answer]
+  BLOCK --> ANSWER
+  ANSWER --> SAVE[Persist conversation to S3 or local JSON]
+  SAVE --> RESP[Return response, sources, session_id, retrieval_used]
+  RESP --> UI[Render answer and source snippets]
+
+  subgraph Ingestion[Knowledge ingestion]
+    MD[Admin markdown upload to POST /ingest] --> SAFE[Validate file size, filename, and UTF-8 markdown]
+    SAFE --> CHUNK[Chunk text with CHUNK_SIZE and CHUNK_OVERLAP]
+    CHUNK --> IEMB[Embed each chunk with SageMaker endpoint]
+    IEMB --> PUT[Store vector and metadata in S3 Vectors]
+  end
+```
+
+`/chat` is a grounded generation pipeline with a small query-rewrite step in front of retrieval. The backend keeps recent chat state, rewrites follow-up questions into standalone search queries when needed, retrieves candidate chunks from S3 Vectors, reranks them with distance and lexical overlap signals, caps repeated chunks from the same document, and injects the selected snippets into the model prompt as a `RETRIEVED KNOWLEDGE` block.
+
+The final Bedrock Nova call is instructed by `backend/context.py` to answer in the user's language, use retrieved sources for company/listing/process/policy facts, and cite only the injected `[S#]` snippets. If RAG is disabled or the embedding/vector dependencies are missing, the app falls back to normal prompt-only Bedrock chat while still preserving session memory.
+
+---
 
 * * *
 
