@@ -35,8 +35,6 @@ The frontend is statically exported by Next.js and served from S3 behind CloudFr
   * S3 Vectors can optionally store indexed markdown chunks for RAG-backed `/chat` answers.
   * Route 53 + ACM are optional and only used when a custom domain is enabled.
 
-> `backend/server.py` now exposes `/ingest` for markdown ingestion and uses S3 Vectors-backed retrieval inside `/chat` when RAG is configured. Terraform can provision an S3 Vectors bucket and index and pass their names to Lambda as `VECTOR_BUCKET` and `VECTOR_INDEX` when `s3vectors_enabled = true`.
-
 ---
 
 ## RAG flow
@@ -74,8 +72,6 @@ flowchart TD
 `/chat` is a grounded generation pipeline with a small query-rewrite step in front of retrieval. The backend keeps recent chat state, rewrites follow-up questions into standalone search queries when needed, retrieves candidate chunks from S3 Vectors, reranks them with distance and lexical overlap signals, caps repeated chunks from the same document, and injects the selected snippets into the model prompt as a `RETRIEVED KNOWLEDGE` block.
 
 The final Bedrock Nova call is instructed by `backend/context.py` to answer in the user's language, use retrieved sources for company/listing/process/policy facts, and cite only the injected `[S#]` snippets. If RAG is disabled or the embedding/vector dependencies are missing, the app falls back to normal prompt-only Bedrock chat while still preserving session memory.
-
----
 
 * * *
 
@@ -117,41 +113,18 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 
 ## Tech stack
 
-### Frontend
 
-  * Next.js 16
-  * React 19
-  * TypeScript 5
-  * Tailwind CSS 4
-  * Lucide React
-
-### Backend
-
-  * Python 3.12
-  * FastAPI
-  * Mangum
-  * Boto3
-  * PyPDF
-  * python-dotenv
-  * python-multipart
-  * Uvicorn
-  * SageMaker Runtime client for optional embeddings
-  * Bedrock light-model query rewriting for RAG
-  * Amazon S3 Vectors client support for RAG ingestion and retrieval
-
-### AWS / Infra
-
-  * AWS Lambda
-  * API Gateway HTTP API
-  * Amazon Bedrock Runtime
-  * Amazon SageMaker endpoint (optional, for embeddings)
-  * S3
-  * CloudFront
-  * Route 53 (optional)
-  * ACM (optional, for custom domain)
-  * Terraform
-  * GitHub Actions
-  * Docker (used to build the Lambda deployment package)
+| Layer | Technology |
+| --- | --- |
+| Frontend | Next.js static export, React, TypeScript, Tailwind CSS |
+| Backend | Python 3.12, FastAPI, Mangum, boto3 |
+| Final LLM | Amazon Bedrock Nova, default `eu.amazon.nova-pro-v1:0` |
+| Query rewrite model | Amazon Bedrock Nova Micro, default `eu.amazon.nova-micro-v1:0` |
+| Embeddings | Optional SageMaker serverless Hugging Face endpoint |
+| Vector store | Optional S3 Vectors bucket and index |
+| Session memory | Local JSON files or S3 object storage |
+| Infrastructure | Terraform, API Gateway HTTP API, Lambda, S3, CloudFront |
+| CI/CD | GitHub Actions, OIDC to AWS, Terraform, uv, npm |
 
 * * *
 
@@ -166,9 +139,7 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 
 * * *
 
-## Local development
-
-### 1) Start the backend
+## Local backend development
 
 From the repository root:
 
@@ -177,7 +148,7 @@ cd backend
 uv sync
 ```
 
-Set local environment variables:
+Useful local environment variables:
 
 ```bash
 export DEFAULT_AWS_REGION=eu-central-1
@@ -222,125 +193,91 @@ Run the API:
 uvicorn server:app --reload --port 8000
 ```
 
-### Backend notes
-
-  * The active prompt and query-rewrite prompt are defined in `backend/context.py`.
-  * Local execution still requires valid AWS credentials because inference is performed against Amazon Bedrock from your machine.
-  * Local memory is stored as JSON files when `USE_S3=false`.
-  * `/embed` returns an error unless `SAGEMAKER_ENDPOINT` is configured.
-  * RAG for `/chat` is active only when `RAG_ENABLED=true` and `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, and `VECTOR_INDEX` are configured.
-  * `/chat` can rewrite follow-up questions with `BEDROCK_LIGHT_MODEL_ID` before retrieval.
-  * `/ingest` accepts markdown files, chunks the content, generates embeddings, and writes chunks to S3 Vectors.
-
-* * *
-
-### 2) Start the frontend
-
-In a second terminal:
-
-```bash
-cd frontend
-npm install
-printf "NEXT_PUBLIC_API_URL=http://localhost:8000\n" > .env.local
-npm run dev
-```
-
-Open:
-
-```text
-http://localhost:3000
-```
-
-* * *
-
-### 3) Smoke test the backend
-
-Health check:
+Backend smoke checks:
 
 ```bash
 curl http://localhost:8000/health
-```
 
-Chat request:
-
-```bash
 curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Hallo, wer bist du?",
-    "session_id": "demo-session"
-  }'
+  -H 'content-type: application/json' \
+  -d '{"message":"Which property would you recommend for a family?"}'
 ```
 
-Conversation history:
-
-```bash
-curl http://localhost:8000/conversation/demo-session
-```
-
-Embedding request (only works when `SAGEMAKER_ENDPOINT` is configured):
+Admin-only endpoints require `x-api-key` when `ADMIN_API_KEY` is set:
 
 ```bash
 curl -X POST http://localhost:8000/embed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "3 Zimmer Wohnung in Berlin mit Balkon"
-  }'
-```
+  -H 'content-type: application/json' \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -d '{"text":"Hello world"}'
 
-Markdown ingestion request (only works when RAG dependencies are configured):
-
-```bash
 curl -X POST http://localhost:8000/ingest \
-  -F "file=@docs/sample.md"
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -F "file=@data/kb/company_faq.md"
 ```
 
-### AI smoke evals
-
-After starting the backend locally, run a small behavioral regression suite:
+Run tests:
 
 ```bash
-cd backend
-python eval_chat.py
+uv run pytest -q
 ```
 
-Against a deployed API:
+Run the golden chat evaluation against a deployed or local API:
 
 ```bash
-cd backend
-API_URL="https://<api-id>.execute-api.eu-central-1.amazonaws.com" python eval_chat.py
+API_BASE_URL=http://localhost:8000 uv run python eval_chat.py
 ```
 
-The evals intentionally check behavior that matters for an enterprise assistant: language adherence, identity consistency, no invented prices, and source/citation discipline.
+---
+
+## Local frontend development
+
+```bash
+cd frontend
+npm ci
+NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
+```
+
+Open the local Next.js app in a browser. The chat component sends `POST /chat` requests and renders returned sources below assistant messages.
+
+Build the static export:
+
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:8000 npm run build
+```
 
 * * *
 
 ## Environment variables
 
-### Backend
+### Backend Lambda / FastAPI
 
 | Variable | Required | Default | Purpose |
-|---|---:|---|---|
-| `DEFAULT_AWS_REGION` | yes | `eu-central-1` | Region used by the Bedrock, SageMaker Runtime, and S3 Vectors clients |
-| `BEDROCK_MODEL_ID` | yes | `eu.amazon.nova-pro-v1:0` locally | Bedrock model to invoke for final answers |
-| `BEDROCK_LIGHT_MODEL_ID` | no | `eu.amazon.nova-micro-v1:0` | Bedrock model used for query rewriting before retrieval |
-| `CORS_ORIGINS` | yes | `http://localhost:3000` | Allowed browser origins |
-| `USE_S3` | no | `false` | Enables S3-backed conversation storage |
-| `S3_BUCKET` | only if `USE_S3=true` | empty | Bucket for session memory |
-| `MEMORY_DIR` | only if `USE_S3=false` | `../memory` | Local directory for chat history |
-| `SAGEMAKER_ENDPOINT` | only for `/embed`, `/ingest`, or RAG | empty | SageMaker endpoint name used to generate embeddings |
-| `VECTOR_BUCKET` | only for `/ingest` or RAG | empty | S3 Vectors bucket name used by ingestion and retrieval |
-| `VECTOR_INDEX` | only for `/ingest` or RAG | empty | S3 Vectors index name used by ingestion and retrieval |
-| `RAG_ENABLED` | no | `true` | Enables retrieval inside `/chat` when vector dependencies are configured |
-| `RETRIEVAL_TOP_K` | no | `3` | Number of source chunks returned to the model after reranking |
-| `LOG_LEVEL` | no | `INFO` | Backend logging level |
-| `MAX_RETRIEVAL_DISTANCE` | no | empty | Optional S3 Vectors distance cutoff; empty disables the cutoff |
-| `SOURCE_SNIPPET_CHARS` | no | `280` | Maximum snippet length included for each returned source |
+| --- | --- | --- | --- |
+| `DEFAULT_AWS_REGION` | yes in AWS | boto3 default | AWS region for Bedrock, SageMaker, S3, and S3 Vectors clients |
+| `BEDROCK_MODEL_ID` | no | `eu.amazon.nova-pro-v1:0` | Final answer model |
+| `BEDROCK_LIGHT_MODEL_ID` | no | `eu.amazon.nova-micro-v1:0` | Lightweight query rewrite model |
+| `CORS_ORIGINS` | no | `*` | Comma-separated allowed browser origins |
+| `USE_S3` | no | `true` | Store conversation memory in S3 when true |
+| `S3_BUCKET` | when `USE_S3=true` | empty | Bucket for conversation memory |
+| `MEMORY_DIR` | when `USE_S3=false` | `../memory` | Local conversation memory directory |
+| `SAGEMAKER_ENDPOINT` | for `/embed`, `/ingest`, RAG | empty | Embedding endpoint name |
+| `VECTOR_BUCKET` | for `/ingest`, RAG | empty | S3 Vectors bucket name |
+| `VECTOR_INDEX` | for `/ingest`, RAG | empty | S3 Vectors index name |
+| `RAG_ENABLED` | no | `true` | Enables retrieval when embedding and vector dependencies exist |
+| `RAW_FETCH_SIZE` | no | `12` | Raw vector candidates fetched before reranking |
+| `FINAL_TOP_K` | no | `3` | Final source chunks passed to the answer model and returned to frontend |
+| `MAX_CHUNKS_PER_DOC` | no | `2` | Per-document diversity cap during retrieval |
+| `MAX_CONTEXT_CHARS` | no | `1500` | Maximum retrieved context injected into final prompt |
+| `MAX_RETRIEVAL_DISTANCE` | no | empty | Optional vector distance cutoff; empty disables cutoff |
+| `SOURCE_SNIPPET_CHARS` | no | `280` | Maximum snippet length returned per source |
 | `CHUNK_SIZE` | no | `1500` | Approximate ingestion chunk size in characters |
-| `CHUNK_OVERLAP` | no | `200` | Character overlap between ingestion chunks |
-| `RAW_FETCH_SIZE` | no | `12` | Number of raw vector matches fetched before reranking |
-| `FINAL_TOP_K` | no | `3` | Maximum number of final source chunks passed to the answer model |
-| `MAX_CHUNKS_PER_DOC` | no | `2` | Per-document cap applied during retrieval source selection |
+| `CHUNK_OVERLAP` | no | `200` | Character overlap between chunks |
+| `ADMIN_API_KEY` | for deployed admin routes | empty | Shared admin key for `/embed`, `/ingest`, and `/conversation/{session_id}` |
+| `LOCAL_DEV` | no | `false` | Allows admin endpoints without a key only when no admin key is set |
+| `MAX_MESSAGE_CHARS` | no | `3000` | Maximum incoming chat message length |
+| `MAX_UPLOAD_BYTES` | no | `1048576` | Maximum markdown upload size for ingestion |
+| `LOG_LEVEL` | no | `INFO` | Backend logging level |
 
 ### Frontend
 
@@ -348,29 +285,18 @@ The evals intentionally check behavior that matters for an enterprise assistant:
 |---|---:|---|
 | `NEXT_PUBLIC_API_URL` | yes | Base URL of the backend API |
 
-### Important repo mismatches and caveats
-
-There are a few repo-level mismatches worth knowing about:
-
-  * `backend/server.py` defaults to `eu.amazon.nova-pro-v1:0` for final answers and `eu.amazon.nova-micro-v1:0` for query rewriting.
-  * Terraform variable defaults also use `eu.amazon.nova-pro-v1:0` for `bedrock_model_id` and `eu.amazon.nova-micro-v1:0` for `bedrock_light_model_id`.
-  * The checked-in `terraform/terraform.tfvars` file overrides `bedrock_model_id` to `eu.amazon.nova-micro-v1:0`.
-  * The checked-in `terraform/terraform.tfvars` file enables SageMaker embeddings and S3 Vectors by default. The current Terraform code declares the matching S3 Vectors variables, provisions the vector bucket and index when `s3vectors_enabled = true`, and passes their names to Lambda as `VECTOR_BUCKET` and `VECTOR_INDEX`.
-  * `RAW_FETCH_SIZE`, `FINAL_TOP_K`, and `MAX_CHUNKS_PER_DOC` are available in backend code but are not currently wired as Terraform variables.
-
-Set `BEDROCK_MODEL_ID` explicitly in every environment if you want the same model everywhere.
-
 * * *
 
 ## Manual AWS deployment
 
-### 1) One-time bootstrap for the Terraform remote state backend
+### 1. Bootstrap remote Terraform state
 
-The deployment script expects an existing S3 bucket for Terraform state and an existing DynamoDB table for state locking.
+The deployment script expects an S3 bucket for Terraform state and a DynamoDB table for state locking.
 
 ```bash
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export AWS_REGION=${DEFAULT_AWS_REGION:-eu-central-1}
+
 aws s3api create-bucket \
   --bucket twin-terraform-state-${AWS_ACCOUNT_ID} \
   --region ${AWS_REGION} \
@@ -384,221 +310,129 @@ aws dynamodb create-table \
   --region ${AWS_REGION}
 ```
 
-> If the bucket or table already exists, skip this step.
+If the bucket or table already exists, skip that resource.
 
-* * *
+### 2. Configure Terraform variables
 
-### 2) Configure Terraform variables
+Edit `terraform/terraform.tfvars` for your environment. The checked-in development file currently enables SageMaker embeddings, S3 Vectors, and RAG.
 
-Edit `terraform/terraform.tfvars` as needed:
+Example:
 
 ```hcl
 project_name = "prop-assist-twin"
-environment = "dev"
-bedrock_model_id = "eu.amazon.nova-micro-v1:0"
+environment  = "dev"
+
+default_aws_region = "eu-central-1"
+bedrock_model_id = "eu.amazon.nova-pro-v1:0"
 bedrock_light_model_id = "eu.amazon.nova-micro-v1:0"
+
 lambda_timeout = 60
 api_throttle_burst_limit = 10
 api_throttle_rate_limit = 5
+
 use_custom_domain = false
 root_domain = ""
 
-# optional embeddings
 sagemaker_embedding_enabled = true
 sagemaker_embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
 sagemaker_embedding_image_uri = "763104351884.dkr.ecr.eu-central-1.amazonaws.com/huggingface-pytorch-inference:1.13.1-transformers4.26.0-cpu-py39-ubuntu20.04"
 sagemaker_embedding_serverless_memory_mb = 3072
 sagemaker_embedding_max_concurrency = 2
 
-# optional RAG tuning
-rag_enabled = true
-retrieval_top_k = 3
-log_level = "INFO"
-max_retrieval_distance = 0.5
-source_snippet_chars = 280
-chunk_size = 1500
-chunk_overlap = 200
-```
-
-### Embeddings
-
-To disable embeddings entirely:
-
-```hcl
-sagemaker_embedding_enabled = false
-sagemaker_embedding_image_uri = ""
-```
-
-> **Production note:** `./scripts/deploy.sh prod <project-name>` runs `terraform apply -var-file=prod.tfvars ...` from the `terraform/` directory. Create `terraform/prod.tfvars` before running a production deployment.
-
-Notes:
-
-  * `sagemaker_embedding_image_uri` is region-specific; the checked-in example is for `eu-central-1`.
-  * When embeddings are enabled, Terraform provisions a serverless SageMaker endpoint and passes its name to Lambda as `SAGEMAKER_ENDPOINT`.
-  * S3 Vectors is configured separately; see the optional S3 Vectors section below.
-
-### S3 Vectors (optional)
-
-To enable S3 Vectors-backed helper functions in Lambda, add the following Terraform variables:
-
-```hcl
 s3vectors_enabled = true
 s3vectors_index_name = "property-kb"
 s3vectors_dimension = 384
 s3vectors_distance_metric = "cosine"
 s3vectors_non_filterable_metadata_keys = ["chunk_text"]
+
+rag_enabled = true
+raw_fetch_size = 5
+final_top_k = 3
+max_chunks_per_doc = 2
+max_context_chars = 1500
+max_retrieval_distance = 0.35
+source_snippet_chars = 200
+chunk_size = 1500
+chunk_overlap = 200
+max_message_chars = 3000
+max_upload_bytes = 1048576
+log_level = "INFO"
 ```
 
-Notes:
+Pass `admin_api_key` through `TF_VAR_admin_api_key` or a secure variable source rather than committing it to `terraform.tfvars`.
 
-  * Terraform provisions the S3 Vectors bucket and index when `s3vectors_enabled = true`.
-  * Lambda receives the provisioned names as `VECTOR_BUCKET` and `VECTOR_INDEX`.
-  * The backend uses these values for `/ingest`, `/chat` RAG retrieval, internal helper functions, and the `/health` payload.
-  * The repo exposes markdown ingestion through `/ingest`; vector search itself remains part of the `/chat` flow rather than a separate public query route.
-
-### Custom domain
-
-To enable a custom domain:
-
-```hcl
-use_custom_domain = true
-root_domain       = "example.com"
-```
-
-Requirements:
-
-  * Public Route 53 hosted zone for the apex domain
-  * ACM certificate validation in `us-east-1` for CloudFront
-
-* * *
-
-### 3) Deploy
-
-Make sure AWS credentials are already available in your shell.
-
-From the repository root:
+### 3. Deploy
 
 ```bash
 chmod +x scripts/deploy.sh
+export DEFAULT_AWS_REGION=eu-central-1
+export TF_VAR_admin_api_key='change-me-to-a-real-secret'
 ./scripts/deploy.sh dev prop-assist-twin
 ```
 
-> `scripts/deploy.sh` defaults the resource prefix to `twin` when the second argument is omitted. Pass `prop-assist-twin` explicitly if you want the deployed resource names to match the repository name.
+The deployment script builds the Lambda package, initializes Terraform with the remote backend, applies infrastructure, writes `frontend/.env.production` with the deployed API URL, builds the static frontend, and syncs `frontend/out` to the frontend S3 bucket.
 
-The deployment script performs the following:
-
-  1. Builds the Lambda package in `backend/lambda-deployment.zip` using Docker and the AWS Lambda Python 3.12 base image.
-  2. Initializes Terraform with the S3 backend and selects or creates the workspace.
-  3. Applies the infrastructure.
-  4. Writes `frontend/.env.production` with the deployed API Gateway URL.
-  5. Builds the frontend and syncs the static export in `frontend/out` to the S3 frontend bucket.
-
-* * *
-
-### 4) Destroy
+### 4. Destroy
 
 ```bash
-export DEFAULT_AWS_REGION=eu-central-1
 chmod +x scripts/destroy.sh
+export DEFAULT_AWS_REGION=eu-central-1
 ./scripts/destroy.sh dev prop-assist-twin
 ```
 
-> `scripts/destroy.sh` defaults the region to `us-east-1` when `DEFAULT_AWS_REGION` is unset, so exporting the deployment region explicitly is recommended.
+The destroy script empties managed frontend and memory buckets before running Terraform destroy.
 
-The destroy script empties the frontend and memory buckets before running `terraform destroy`. If `backend/lambda-deployment.zip` does not exist, the script creates a dummy archive so destroy can still proceed.
+---
 
-* * *
+## GitHub Actions deployment
 
-## Terraform outputs
-
-After a successful apply, useful outputs include:
-
-  * `api_gateway_url`
-  * `cloudfront_url`
-  * `s3_frontend_bucket`
-  * `s3_memory_bucket`
-  * `lambda_function_name`
-  * `custom_domain_url`
-  * `sagemaker_embedding_endpoint_name`
-  * `sagemaker_embedding_endpoint_arn`
-  * `s3vectors_bucket_name`
-  * `s3vectors_bucket_arn`
-  * `s3vectors_index_name`
-  * `s3vectors_index_arn`
-
-* * *
-
-## CI/CD
-
-GitHub Actions deployment is defined in:
-
-```text
-.github/workflows/deploy.yml
-```
-
-It runs on:
-
-  * push to `main`
-  * manual `workflow_dispatch`
+The workflow at `.github/workflows/deploy.yml` runs on pushes to `main` and on manual dispatch. It uses GitHub OIDC to assume an AWS role, installs Python 3.12, `uv`, Terraform, Node 20, and frontend dependencies, then runs frontend lint/build, backend package build, Terraform format/validation, backend tests, and `scripts/deploy.sh`.
 
 Required GitHub secrets:
 
-  * `AWS_ROLE_ARN`
-  * `DEFAULT_AWS_REGION`
+| Secret | Purpose |
+| --- | --- |
+| `AWS_ROLE_ARN` | IAM role assumed by GitHub Actions through OIDC |
+| `DEFAULT_AWS_REGION` | AWS region used by the workflow and deployment script |
+| `ADMIN_API_KEY` | Admin key passed to Terraform as `TF_VAR_admin_api_key` |
 
-Optional / currently redundant:
+---
 
-  * `AWS_ACCOUNT_ID` — the workflow exports this value, but the current deployment scripts derive the account ID with `aws sts get-caller-identity`.
+## RAG knowledge ingestion
 
-The workflow:
+The repository includes seed markdown knowledge under `backend/data/kb`. To index it against a running API with admin auth:
 
-  1. Checks out the repository.
-  2. Assumes the AWS role.
-  3. Installs Python 3.12, Node 20, Terraform, and `uv`.
-  4. Installs backend dependencies and runs `pytest -q`.
-  5. Executes `scripts/deploy.sh`.
-  6. Reads Terraform outputs.
-  7. Invalidates CloudFront.
+```bash
+cd backend
+for file in data/kb/*.md; do
+  curl -X POST "$API_BASE_URL/ingest" \
+    -H "x-api-key: $ADMIN_API_KEY" \
+    -F "file=@${file}"
+done
+```
 
-> The current workflow calls `scripts/deploy.sh` without the optional project-name argument, so the default resource prefix is `twin` unless the workflow is adjusted.
-
-> Because the workflow uses the checked-in Terraform files, it will also provision the SageMaker embedding endpoint whenever `terraform/terraform.tfvars` keeps `sagemaker_embedding_enabled = true`.
+Only markdown uploads with safe filenames are accepted. The backend validates file size and UTF-8 content before chunking and embedding.
 
 * * *
 
 ## API endpoints
 
-### `GET /`
-
-Returns a service descriptor with memory/storage/model metadata.
-
 ### `GET /health`
 
-Returns a simple health payload including:
-
-```json
-{
-  "status": "healthy",
-  "use_s3": true,
-  "bedrock_model": "...",
-  "sagemaker_endpoint_configure": true,
-  "s3vectors_configured": true,
-  "rag_enabled": true
-}
-```
+Returns service status and configuration flags for memory, embeddings, vectors, and RAG.
 
 ### `POST /chat`
 
-Accepts:
+Request:
 
 ```json
 {
-  "message": "Hallo",
-  "session_id": "optional-session-id"
+  "message": "Which properties are available in Berlin?",
+  "session_id": "optional-existing-session"
 }
 ```
 
-Returns:
+Response shape:
 
 ```json
 {
@@ -606,142 +440,40 @@ Returns:
   "session_id": "...",
   "sources": [
     {
-      "id": "...",
-      "doc_id": "...",
-      "title": "...",
+      "id": "company_faq-0",
+      "title": "company_faq.md",
+      "source_path": "company_faq.md",
       "snippet": "...",
-      "distance": 0.123,
-      "score": 0.456
+      "doc_type": "markdown",
+      "chunk_index": 0,
+      "distance": 0.18
     }
   ],
   "retrieval_used": true
 }
 ```
 
-When RAG is configured, `/chat` rewrites follow-up questions with the light Bedrock model, fetches candidate chunks from S3 Vectors, applies lexical reranking, and passes the selected source snippets to the final answer model.
+### `POST /embed` admin
 
-### `POST /embed`
+Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `ADMIN_API_KEY` is configured.
 
-Accepts:
+### `POST /ingest` admin
 
-```json
-{
-  "text": "3 room apartment in Munich"
-}
-```
+Accepts a markdown upload, chunks it, embeds each chunk, and writes vectors plus metadata to S3 Vectors. Requires `x-api-key` when `ADMIN_API_KEY` is configured.
 
-Returns:
+### `GET /conversation/{session_id}` admin
 
-```json
-{
-  "embedding": [0.123, -0.456, 0.789]
-}
-```
-
-This route is exposed both locally and in the Terraform-managed API Gateway, but it only works when `SAGEMAKER_ENDPOINT` is configured.
-
-### `POST /ingest`
-
-Accepts multipart form upload of a markdown file:
-
-```bash
-curl -X POST http://localhost:8000/ingest \
-  -F "file=@docs/sample.md"
-```
-
-Returns:
-
-```json
-{
-  "filename": "sample.md",
-  "chunks_indexed": 3,
-  "status": "success"
-}
-```
-
-This route is exposed both locally and in the Terraform-managed API Gateway. It only accepts `.md` files and requires `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, and `VECTOR_INDEX`.
-
-### `GET /conversation/{session_id}`
-
-Implemented in FastAPI for local use, but not currently exposed by the Terraform-managed API Gateway routes.
-
-If you want this endpoint available in AWS, add a matching `GET /conversation/{session_id}` route in `terraform/main.tf`.
-
-### Internal vector helpers
-
-The backend currently defines:
-
-  * `index_text_chunk(text, metadata=None, vector_id=None)`
-  * `search_text_chunks(query, top_k=5)`
-
-These use the S3 Vectors client and require `VECTOR_BUCKET` + `VECTOR_INDEX`. Terraform can provision those resources and pass the resulting names to Lambda when `s3vectors_enabled = true`. Public ingestion is handled by `/ingest`; vector search is used internally by `/chat` rather than exposed as a standalone public query route.
+Reads stored conversation history for a session. This route exists in the FastAPI app and is protected by the same admin key, but it is not exposed as an API Gateway route in the current Terraform configuration.
 
 * * *
 
-## Troubleshooting
+## Notes and troubleshooting
 
-### Bedrock access denied
-
-  * Confirm the AWS principal has Bedrock access.
-  * Confirm the selected Nova model is enabled in the target region.
-
-### `/embed` returns `SAGEMAKER ENDPOINT not configured`
-
-  * Set `SAGEMAKER_ENDPOINT` locally, or enable SageMaker embeddings in Terraform so Lambda receives it automatically.
-  * Confirm the endpoint exists and is in the same region as `DEFAULT_AWS_REGION`.
-
-### Embedding deployment fails
-
-  * If `sagemaker_embedding_enabled=true`, `sagemaker_embedding_image_uri` must be valid for the target region.
-  * Confirm your account has SageMaker permissions and enough serverless inference quota.
-
-### `/ingest` returns an error
-
-  * Confirm the uploaded file has a `.md` extension.
-  * Confirm `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, and `VECTOR_INDEX` are configured.
-  * Confirm the Lambda role or local AWS principal can invoke the SageMaker endpoint and write to S3 Vectors.
-
-### RAG is not used by `/chat`
-
-  * Confirm `RAG_ENABLED=true`.
-  * Confirm the health payload reports `sagemaker_endpoint_configure=true` and `s3vectors_configured=true`.
-  * Confirm markdown content has been indexed through `/ingest` or the indexing helper path.
-
-### Frontend cannot call the API
-
-  * Check `NEXT_PUBLIC_API_URL`.
-  * Check `CORS_ORIGINS` on the backend.
-
-### Lambda package build fails
-
-  * Docker is required because the deployment package is built against the Lambda Python 3.12 runtime image.
-
-### Terraform init fails
-
-  * Confirm the remote state bucket and DynamoDB lock table already exist.
-  * Confirm the AWS credentials point to the correct account.
-
-### Expected vector search support, but health reports `s3vectors_configured=false`
-
-  * `s3vectors_configured` only becomes true when both `VECTOR_BUCKET` and `VECTOR_INDEX` are set.
-  * In Terraform-managed deployments, `VECTOR_BUCKET` and `VECTOR_INDEX` are populated automatically when `s3vectors_enabled = true`. `/ingest` and RAG-backed `/chat` still require the SageMaker embedding endpoint as well.
-
-### Custom domain does not come up
-
-  * Confirm `use_custom_domain=true` and `root_domain` is set.
-  * Confirm the hosted zone exists in Route 53.
-  * Confirm ACM validation completed in `us-east-1`.
-
-* * *
-
-## Implementation notes
-
-  * The frontend uses `output: "export"`, so the production site is a static export rather than a server-rendered Next.js deployment.
-  * `next.config.ts` also sets `images.unoptimized = true` for static export compatibility.
-  * The browser calls API Gateway directly; CloudFront is only in front of the static frontend bucket.
-  * Lambda stores session memory in S3 when `USE_S3=true`; otherwise it uses local JSON files.
-  * The active answer prompt and query-rewrite instructions live in `backend/context.py`.
-  * The prompt template tells the model to use retrieved sources for company, listing, pricing, policy, availability, maintenance, document, and account-specific questions, and to cite sources when sources are provided.
-  * `/chat` can return `sources` and `retrieval_used`; the frontend renders source snippets under assistant messages when present.
-  * The frontend chat widget keeps `session_id` only in React state; a page refresh starts a new session and the UI does not currently rehydrate history from `/conversation/{session_id}`.
-  * The frontend includes an empty-state message, loading indicator, source display, and Enter-to-send behavior, but it currently only calls `/chat`.
+- Bedrock model access must be enabled in the same region used by the Lambda.
+- The default final model is `eu.amazon.nova-pro-v1:0`; the default rewrite model is `eu.amazon.nova-micro-v1:0`.
+- RAG only runs when `RAG_ENABLED=true` and `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, and `VECTOR_INDEX` are all configured.
+- `POST /chat` still works without RAG; it simply skips retrieval and answers from the base prompt plus conversation history.
+- `POST /embed` and `POST /ingest` will fail if no SageMaker embedding endpoint is configured.
+- `POST /ingest` and RAG retrieval require S3 Vectors configuration.
+- In local development, set `LOCAL_DEV=true` with an empty `ADMIN_API_KEY` to avoid blocking yourself on admin-only routes.
+- In deployed environments, always set a non-empty `ADMIN_API_KEY` and send it as `x-api-key` for admin routes.
