@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from context import prompt, rewrite_prompt
 
 # Load environment variables
@@ -274,14 +275,36 @@ def get_embedding(text: str) -> List[float]:
     return result
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
-    """Generator that yields text chunks based on size and overlap."""
-    cursor = 0
-    while cursor < len(text):
-        chunk = text[cursor: cursor + size]
-        yield chunk
-        if cursor + size >= len(text):
-            break
-        cursor += (size - overlap)
+    """
+    Generator that yields text chunks using LangChain's RecursiveCharacterTextSplitter.
+    
+    This splitter respects markdown structure (headers, paragraphs, sentences)
+    before falling back to character-based splitting. The hierarchy of separators is:
+    ["\\n\\n", "\\n", " ", ""]
+    
+    Args:
+        text: The input text to chunk
+        size: Target chunk size in characters (chunk_size)
+        overlap: Number of characters to overlap between chunks
+        
+    Yields:
+        Text chunks respecting semantic boundaries
+    """
+    # Initialize the splitter with markdown-aware separators
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", " ", ""],  # Hierarchy: paragraphs > lines > words > characters
+        is_separator_regex=False
+    )
+    
+    # Split the text
+    chunks = splitter.split_text(text)
+    
+    # Yield each chunk
+    for chunk in chunks:
+        if chunk.strip():  # Only yield non-empty chunks
+            yield chunk
 
 def index_text_chunk(
     text: str,

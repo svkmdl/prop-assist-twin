@@ -73,6 +73,68 @@ flowchart TD
 
 The final Bedrock Nova call is instructed by `backend/context.py` to answer in the user's language, use retrieved sources for company/listing/process/policy facts, and cite only the injected `[S#]` snippets. If RAG is disabled or the embedding/vector dependencies are missing, the app falls back to normal prompt-only Bedrock chat while still preserving session memory.
 
+## Semantic text chunking
+
+The `/ingest` endpoint uses **LangChain's `RecursiveCharacterTextSplitter`** for semantic text chunking. This respects document structure before falling back to character-based splitting, ensuring better RAG retrieval quality by maintaining semantic coherence within chunks.
+
+### Splitting hierarchy
+
+The `RecursiveCharacterTextSplitter` applies the following hierarchy to preserve document structure:
+
+1. **Paragraph breaks** (`\n\n`) – Sections separated by blank lines are kept together
+2. **Line breaks** (`\n`) – Single newlines form natural splitting points  
+3. **Word boundaries** (space) – Words are preserved, never split mid-word
+4. **Characters** – Fallback character splitting for oversized chunks
+
+### Benefits
+
+| Aspect | Improvement |
+|--------|------------|
+| **Paragraph coherence** | Chunks respect paragraph boundaries |
+| **Line break awareness** | Single newlines preserve document structure |
+| **Word integrity** | Words are never split mid-token |
+| **Context continuity** | Configurable overlap maintains context between chunks |
+| **Size guarantee** | All chunks respect maximum size limits |
+| **RAG quality** | More coherent chunks → better vector embeddings |
+| **Battle-tested** | Uses industry-standard LangChain implementation |
+
+### Configuration
+
+The chunker is controlled by existing environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CHUNK_SIZE` | `1500` | Target chunk size in characters |
+| `CHUNK_OVERLAP` | `200` | Character overlap between consecutive chunks for context continuity |
+
+Note: `CHUNK_OVERLAP` must be less than `CHUNK_SIZE` (LangChain validation).
+
+### Example
+
+For a markdown document like:
+
+```markdown
+# Property Investment Guide
+
+This is the introduction covering market trends and opportunities.
+
+## Residential Properties
+
+Single-family homes are standalone structures. They offer privacy and outdoor space.
+
+### Market Analysis
+
+The residential market shows strong growth potential. Prices have been rising steadily.
+```
+
+The `RecursiveCharacterTextSplitter` produces chunks that:
+- Keep paragraphs together when possible (separated by `\n\n`)
+- Respect line boundaries (separated by `\n`)
+- Preserve word boundaries (separated by spaces)
+- Maintain semantic coherence for better vector embeddings
+
+This results in more relevant RAG retrieval compared to naive character-based splitting.
+
 * * *
 
 ## Repository layout
@@ -117,9 +179,10 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 | Layer | Technology |
 | --- | --- |
 | Frontend | Next.js static export, React, TypeScript, Tailwind CSS |
-| Backend | Python 3.12, FastAPI, Mangum, boto3 |
+| Backend | Python 3.12, FastAPI, Mangum, boto3, LangChain text splitters |
 | Final LLM | Amazon Bedrock Nova, default `eu.amazon.nova-pro-v1:0` |
 | Query rewrite model | Amazon Bedrock Nova Micro, default `eu.amazon.nova-micro-v1:0` |
+| Text chunking | LangChain `RecursiveCharacterTextSplitter` for semantic document chunking |
 | Embeddings | Optional SageMaker serverless Hugging Face endpoint |
 | Vector store | Optional S3 Vectors bucket and index |
 | Session memory | Local JSON files or S3 object storage |
@@ -178,6 +241,8 @@ export MAX_CHUNKS_PER_DOC=2
 export MAX_CONTEXT_CHARS=1500
 export MAX_RETRIEVAL_DISTANCE=
 export SOURCE_SNIPPET_CHARS=280
+
+# Semantic chunking (markdown-aware with fallback to character-based)
 export CHUNK_SIZE=1500
 export CHUNK_OVERLAP=200
 
@@ -271,8 +336,8 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run build
 | `MAX_CONTEXT_CHARS` | no | `1500` | Maximum retrieved context injected into final prompt |
 | `MAX_RETRIEVAL_DISTANCE` | no | empty | Optional vector distance cutoff; empty disables cutoff |
 | `SOURCE_SNIPPET_CHARS` | no | `280` | Maximum snippet length returned per source |
-| `CHUNK_SIZE` | no | `1500` | Approximate ingestion chunk size in characters |
-| `CHUNK_OVERLAP` | no | `200` | Character overlap between chunks |
+| `CHUNK_SIZE` | no | `1500` | Target chunk size in characters for semantic chunking (markdown-aware with sentence fallback) |
+| `CHUNK_OVERLAP` | no | `200` | Character overlap between consecutive chunks for context continuity |
 | `ADMIN_API_KEY` | for deployed admin routes | empty | Shared admin key for `/embed`, `/ingest`, and `/conversation/{session_id}` |
 | `LOCAL_DEV` | no | `false` | Allows admin endpoints without a key only when no admin key is set |
 | `MAX_MESSAGE_CHARS` | no | `3000` | Maximum incoming chat message length |
@@ -413,6 +478,8 @@ done
 
 Only markdown uploads with safe filenames are accepted. The backend validates file size and UTF-8 content before chunking and embedding.
 
+**Chunking strategy**: Documents are processed through LangChain's `RecursiveCharacterTextSplitter` (see [Semantic text chunking](#semantic-text-chunking)) which respects paragraph breaks, line breaks, and word boundaries before falling back to character-based splitting. This produces more coherent chunks, resulting in better vector embeddings and more accurate RAG retrieval.
+
 * * *
 
 ## API endpoints
@@ -459,7 +526,7 @@ Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `
 
 ### `POST /ingest` admin
 
-Accepts a markdown upload, chunks it, embeds each chunk, and writes vectors plus metadata to S3 Vectors. Requires `x-api-key` when `ADMIN_API_KEY` is configured.
+Accepts a markdown upload, applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata to S3 Vectors. Requires `x-api-key` when `ADMIN_API_KEY` is configured. See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
 
 ### `GET /conversation/{session_id}` admin
 
