@@ -57,18 +57,23 @@ def test_retrieve_sources_reranks_and_diversifies(server_module, monkeypatch):
 
     # Assertions
 
-    # Check Diversity: Even though doc-2 had a better 'distance' than doc-3,
-    # doc-2 should be dropped because doc-1 (same path) was already picked.
-    # Expected order based on combined score: doc-1, doc-3, doc-4
-    assert [s.id for s in sources] == ["doc-1", "doc-3", "doc-4"]
+    # BM25-based ranking with diversity filter:
+    # doc-4 has repeated "balcony" term, giving it highest BM25 score
+    # Combined scores: doc-4 (1.0826), doc-1 (1.0800), doc-3 (1.0000), doc-2 (0.9500)
+    # With diversity (all different paths): doc-4, doc-1, doc-3
+    assert [s.id for s in sources] == ["doc-4", "doc-1", "doc-3"]
 
-    # Verify doc-1 (The winner)
-    assert sources[0].title == "Listing A"
-    assert sources[0].distance == 0.12
+    # Verify doc-4 (The winner due to repeated terms in BM25)
+    assert sources[0].title == "Guide C"
+    assert sources[0].distance == 0.15
 
-    # Verify truncation logic still works on the last item
-    assert sources[2].snippet.endswith("…")
-    assert len(sources[2].snippet) <= server_module.SOURCE_SNIPPET_CHARS
+    # Verify doc-1 (Second due to higher combined score)
+    assert sources[1].title == "Listing A"
+    assert sources[1].distance == 0.12
+
+    # Verify truncation logic still works on one of the items
+    assert sources[0].snippet.endswith("…")
+    assert len(sources[0].snippet) <= server_module.SOURCE_SNIPPET_CHARS
 
     # Verify document counts in results
     paths = [s.source_path for s in sources]

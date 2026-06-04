@@ -9,3 +9,4 @@ mangum
 pytest
 httpx
 langchain-text-splitters
+rank-bm25
