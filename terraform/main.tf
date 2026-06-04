@@ -23,6 +23,20 @@ locals {
   }
 }
 
+# S3 bucket for lambda deployment
+resource "aws_s3_bucket" "lambda_deployments" {
+  bucket = "${local.name_prefix}-lambda-artifacts--${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_object" "api_code" {
+  bucket = aws_s3_bucket.lambda_deployments.id
+  key    = "backend/lambda-deployment-${filebase64sha256("${path.module}/../backend/lambda-deployment.zip")}.zip"
+  source = "${path.module}/../backend/lambda-deployment.zip"
+
+  # This ensures the S3 object is replaced only when the code changes
+  etag = filemd5("${path.module}/../backend/lambda-deployment.zip")
+}
+
 # S3 bucket for conversation memory
 resource "aws_s3_bucket" "memory" {
   bucket = "${local.name_prefix}-memory-${data.aws_caller_identity.current.account_id}"
@@ -279,7 +293,8 @@ resource "aws_sagemaker_endpoint" "embedding_endpoint" {
 
 # Lambda function
 resource "aws_lambda_function" "api" {
-  filename         = "${path.module}/../backend/lambda-deployment.zip"
+  s3_bucket        = aws_s3_bucket.lambda_deployments.id
+  s3_key           = aws_s3_object.api_code.key
   function_name    = "${local.name_prefix}-api"
   role             = aws_iam_role.lambda_role.arn
   handler          = "lambda_handler.handler"
