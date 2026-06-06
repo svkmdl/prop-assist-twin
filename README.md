@@ -287,6 +287,10 @@ Run tests:
 uv run pytest -q
 ```
 
+Tests run with coverage enabled. The suite enforces a minimum coverage
+threshold of 90% on `server.py` (configured via `fail_under` in
+`backend/pyproject.toml`); `uv run pytest` fails if coverage drops below it.
+
 Run the golden chat evaluation against a deployed or local API:
 
 ```bash
@@ -451,7 +455,7 @@ The destroy script empties managed frontend and memory buckets before running Te
 
 ## GitHub Actions deployment
 
-The workflow at `.github/workflows/deploy.yml` runs on pushes to `main` and on manual dispatch. It uses GitHub OIDC to assume an AWS role, installs Python 3.12, `uv`, Terraform, Node 20, and frontend dependencies, then runs frontend lint/build, backend package build, Terraform format/validation, backend tests, and `scripts/deploy.sh`.
+The workflow at `.github/workflows/deploy.yml` runs on pushes to `main` and on manual dispatch. It uses GitHub OIDC to assume an AWS role, installs Python 3.12, `uv`, Terraform, Node 20, and frontend dependencies, then runs frontend lint/build, backend package build, Terraform format/validation, backend tests, and `scripts/deploy.sh`. The backend test step enforces the 90% coverage gate and fails the deployment if coverage drops below the threshold.
 
 Required GitHub secrets:
 
