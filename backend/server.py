@@ -722,6 +722,8 @@ async def get_conversation(session_id: str):
     try:
         conversation = load_conversation(session_id)
         return {"session_id": session_id, "messages": conversation}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
