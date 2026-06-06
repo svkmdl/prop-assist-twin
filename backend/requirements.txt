@@ -10,3 +10,4 @@ pytest
 httpx
 langchain-text-splitters
 rank-bm25
+pytest-cov

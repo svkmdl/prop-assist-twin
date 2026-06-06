@@ -19,3 +19,17 @@ dependencies = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["lambda-package", ".venv", ".git"]
+addopts = "--cov=server --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["server"]
+omit = ["lambda-package/*", "tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90
+
+[dependency-groups]
+dev = [
+    "pytest-cov>=7.1.0",
+]

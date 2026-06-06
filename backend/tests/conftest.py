@@ -18,35 +18,63 @@ def _fake_boto3_client(*args, **kwargs):
     return SimpleNamespace()
 
 
-@pytest.fixture
-def server_module(monkeypatch, tmp_path):
+# Default environment for a hermetic, local testing state.
+# Disables S3 and EC2 metadata to avoid timeouts and costs during tests.
+DEFAULT_TEST_ENV = {
+    "AWS_EC2_METADATA_DISABLED": "true",
+    "USE_S3": "false",
+    "DEFAULT_AWS_REGION": "eu-central-1",
+    "SAGEMAKER_ENDPOINT": "",
+    "VECTOR_BUCKET": "",
+    "VECTOR_INDEX": "",
+    "RAG_ENABLED": "true",
+    "LOCAL_DEV": "true",
+}
+
+
+def _load_server_module(monkeypatch, tmp_path, env_overrides=None):
+    """Import a fresh `server` module with a controlled environment.
+
+    Re-importing per call forces the module-level configuration constants
+    (read from env at import time) to pick up the requested overrides.
+    """
     monkeypatch.chdir(BACKEND_DIR)
     monkeypatch.syspath_prepend(str(BACKEND_DIR))
     monkeypatch.syspath_prepend(str(LAMBDA_PKG_DIR))
 
-    # Force the application into a local testing state.
-    # We disable S3 and EC2 metadata to avoid timeouts and costs during tests.
-    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    monkeypatch.setenv("USE_S3", "false")
+    env = dict(DEFAULT_TEST_ENV)
+    env["MEMORY_DIR"] = str(tmp_path / "memory")
+    if env_overrides:
+        env.update(env_overrides)
 
-    monkeypatch.setenv("DEFAULT_AWS_REGION", "eu-central-1")
-    monkeypatch.setenv("MEMORY_DIR", str(tmp_path / "memory"))
-    monkeypatch.setenv("SAGEMAKER_ENDPOINT", "")
-    monkeypatch.setenv("VECTOR_BUCKET", "")
-    monkeypatch.setenv("VECTOR_INDEX", "")
-    monkeypatch.setenv("RAG_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_DEV", "true")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
 
     monkeypatch.setattr(boto3, "client", _fake_boto3_client)
 
-    # Clear the cache of these modules.
-    # This forces Python to re-import them with the NEW environment variables
-    # defined above, ensuring a clean state for every test run.
+    # Force a clean re-import so the new environment variables take effect.
     for name in ("server", "context", "resources", "lambda_handler"):
         sys.modules.pop(name, None)
 
     # Import as `server`, not `backend.server`
     return importlib.import_module("server")
+
+
+@pytest.fixture
+def server_module(monkeypatch, tmp_path):
+    return _load_server_module(monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def make_server(monkeypatch, tmp_path):
+    """Factory to import `server` with custom environment overrides.
+
+    Intended to be called once per test (each call re-imports the module).
+    """
+    def _factory(**env_overrides):
+        return _load_server_module(monkeypatch, tmp_path, env_overrides)
+
+    return _factory
 
 
 @pytest.fixture
@@ -57,3 +85,8 @@ def client(server_module):
     """
     with TestClient(server_module.app) as test_client:
         yield test_client
+
+
+def make_client(server_module):
+    """Build a TestClient context manager for a custom server module."""
+    return TestClient(server_module.app)
