@@ -39,8 +39,13 @@ def _load_server_module(monkeypatch, tmp_path, env_overrides=None):
     (read from env at import time) to pick up the requested overrides.
     """
     monkeypatch.chdir(BACKEND_DIR)
-    monkeypatch.syspath_prepend(str(BACKEND_DIR))
+    # Prepend LAMBDA_PKG_DIR first, then BACKEND_DIR, so BACKEND_DIR ends up at
+    # index 0 of sys.path and wins. This guarantees `import server` loads the
+    # source under test (backend/server.py) and never a copy left in
+    # lambda-package/ by a prior build step (which would otherwise be excluded
+    # by coverage's omit rule, yielding 0% coverage).
     monkeypatch.syspath_prepend(str(LAMBDA_PKG_DIR))
+    monkeypatch.syspath_prepend(str(BACKEND_DIR))
 
     env = dict(DEFAULT_TEST_ENV)
     env["MEMORY_DIR"] = str(tmp_path / "memory")
