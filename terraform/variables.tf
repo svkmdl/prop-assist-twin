@@ -232,3 +232,8 @@ variable "max_context_chars" {
   type        = number
   default     = 1500
 }
+variable "ingestion_max_workers" {
+  description = "Maximum number of concurrent ingestion workers"
+  type        = number
+  default     = 4
+}

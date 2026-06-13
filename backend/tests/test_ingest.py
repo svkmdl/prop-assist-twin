@@ -8,6 +8,7 @@ The default `client` fixture runs with LOCAL_DEV=true, so the admin gate on
 /ingest is open and these tests exercise the validation logic directly.
 """
 import pytest
+from fastapi import HTTPException
 
 
 class TestIngestValidation:
@@ -42,8 +43,14 @@ class TestIngestValidation:
     ):
         indexed = []
 
+        monkeypatch.setattr(
+            server_module,
+            "chunk_text",
+            lambda content: iter(["first chunk", "second chunk", "third chunk"]),
+        )
+
         def fake_index(text, vector_id, metadata):
-            indexed.append((vector_id, metadata))
+            indexed.append((text, vector_id, metadata))
             return vector_id
 
         monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
@@ -61,11 +68,60 @@ class TestIngestValidation:
         assert body["filename"] == "notes.md"
         assert body["chunks_indexed"] == len(indexed) >= 1
 
-        _, metadata = indexed[0]
-        assert metadata["title"] == "notes"
-        assert metadata["doc_type"] == ".md"
-        assert metadata["source_path"] == "api_upload/notes.md"
-        assert metadata["chunk_index"] == 0
+        indexed_by_id = {vector_id: (text, metadata) for text, vector_id, metadata in indexed}
+        assert set(indexed_by_id) == {"notes.md_0", "notes.md_1", "notes.md_2"}
+
+        for chunk_index in range(3):
+            text, metadata = indexed_by_id[f"notes.md_{chunk_index}"]
+            assert text == ["first chunk", "second chunk", "third chunk"][chunk_index]
+            assert metadata["title"] == "notes"
+            assert metadata["doc_type"] == ".md"
+            assert metadata["source_path"] == "api_upload/notes.md"
+            assert metadata["chunk_index"] == chunk_index
+
+    def test_worker_http_exception_propagates(self, client, server_module, monkeypatch):
+        monkeypatch.setattr(
+            server_module,
+            "chunk_text",
+            lambda content: iter(["first chunk", "second chunk"]),
+        )
+
+        def fake_index(text, vector_id, metadata):
+            if vector_id == "notes.md_1":
+                raise HTTPException(status_code=503, detail="vector store unavailable")
+            return vector_id
+
+        monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
+
+        resp = client.post(
+            "/ingest",
+            files={"file": ("notes.md", b"# Title", "text/markdown")},
+        )
+
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "vector store unavailable"
+
+    def test_worker_generic_exception_returns_500(self, client, server_module, monkeypatch):
+        monkeypatch.setattr(
+            server_module,
+            "chunk_text",
+            lambda content: iter(["first chunk", "second chunk"]),
+        )
+
+        def fake_index(text, vector_id, metadata):
+            if vector_id == "notes.md_1":
+                raise RuntimeError("indexing failed")
+            return vector_id
+
+        monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
+
+        resp = client.post(
+            "/ingest",
+            files={"file": ("notes.md", b"# Title", "text/markdown")},
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Ingestion error: indexing failed"
 
 
 class TestChatRequestValidation:

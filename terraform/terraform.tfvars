@@ -32,3 +32,4 @@ chunk_size             = 1500
 chunk_overlap          = 200
 max_message_chars      = 3000
 max_upload_bytes       = 1048576
+ingestion_max_workers  = 4
