@@ -17,6 +17,10 @@ s3vectors_enabled                        = true
 s3vectors_index_name                     = "property-kb"
 s3vectors_dimension                      = 384
 s3vectors_distance_metric                = "cosine"
+# Only chunk_text is large; all other worker metadata (tenant_id, source_key,
+# title, doc_type, chunk_index, ...) is small and stays filterable. Changing
+# this list is immutable and forces the vector index to be replaced, so leave
+# it as-is to avoid wiping existing embeddings.
 s3vectors_non_filterable_metadata_keys = [
   "chunk_text"
 ]
@@ -32,4 +36,19 @@ chunk_size             = 1500
 chunk_overlap          = 200
 max_message_chars      = 3000
 max_upload_bytes       = 1048576
-ingestion_max_workers  = 4
+# Keep the per-document embedding fan-out at/below the serverless endpoint's
+# max-concurrency (sagemaker_embedding_max_concurrency) to avoid self-inflicted
+# InvokeEndpoint throttling. Cross-invocation bursts are absorbed by adaptive
+# retries (embedding_max_attempts).
+ingestion_max_workers  = 2
+embedding_max_attempts = 10
+
+# Event-driven RAG ingestion pipeline
+rag_ingest_enabled                 = true
+rag_ingest_lambda_timeout          = 300
+rag_ingest_lambda_memory           = 1024
+rag_ingest_reserved_concurrency    = 3
+rag_ingest_max_receive_count       = 5
+rag_ingest_batch_size              = 1
+rag_ingest_queue_age_alarm_seconds = 900
+alarm_sns_topic_arn                = ""

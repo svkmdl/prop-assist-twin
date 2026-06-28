@@ -13,8 +13,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from common import chunking, embeddings, vector_store
+from common.models import SourceItem
 from context import prompt, rewrite_prompt
 
 # Load environment variables
@@ -34,10 +36,17 @@ app.add_middleware(
 
 DEFAULT_AWS_REGION = os.getenv("DEFAULT_AWS_REGION", "eu-central-1")
 
+# Adaptive retries absorb throttling from the small-concurrency serverless
+# embedding endpoint instead of failing the request after a few attempts.
+EMBEDDING_MAX_ATTEMPTS = max(1, int(os.getenv("EMBEDDING_MAX_ATTEMPTS", "10")))
+
 # Initialize SageMaker client
 sagemaker_client = boto3.client(
     service_name = "sagemaker-runtime",
-    region_name=DEFAULT_AWS_REGION
+    region_name=DEFAULT_AWS_REGION,
+    config=BotoConfig(
+        retries={"max_attempts": EMBEDDING_MAX_ATTEMPTS, "mode": "adaptive"}
+    )
 )
 
 # Initialize S3Vectors client
@@ -115,16 +124,6 @@ class ChatRequest(BaseModel):
         pattern=SESSION_ID_PATTERN,
         max_length=64
     )
-
-class SourceItem(BaseModel):
-    id: str
-    title: Optional[str] = None
-    source_path: Optional[str] = None
-    snippet: str
-    context: Optional[str] = Field(default=None, exclude=True) # Internal model context, excluded from API response
-    doc_type: Optional[str] = None
-    chunk_index: Optional[int] = None
-    distance: Optional[float] = None
 
 class ChatResponse(BaseModel):
     response: str
@@ -262,51 +261,11 @@ def get_embedding(text: str) -> List[float]:
     if not SAGEMAKER_ENDPOINT:
         raise HTTPException(status_code=500, detail="SAGEMAKER ENDPOINT not configured")
 
-    response = sagemaker_client.invoke_endpoint(
-        EndpointName=SAGEMAKER_ENDPOINT,
-        ContentType="application/json",
-        Body=json.dumps({"inputs": text})
-    )
-    result = json.loads(response["Body"].read().decode())
-
-    if isinstance(result, list) and len(result) > 0:
-        if isinstance(result[0], list) and len(result[0]) > 0:
-            if isinstance(result[0][0], list):
-                return result[0][0]
-            return result[0]
-    return result
+    return embeddings.embed_text(text, client=sagemaker_client, endpoint=SAGEMAKER_ENDPOINT)
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
-    """
-    Generator that yields text chunks using LangChain's RecursiveCharacterTextSplitter.
-    
-    This splitter respects markdown structure (headers, paragraphs, sentences)
-    before falling back to character-based splitting. The hierarchy of separators is:
-    ["\\n\\n", "\\n", " ", ""]
-    
-    Args:
-        text: The input text to chunk
-        size: Target chunk size in characters (chunk_size)
-        overlap: Number of characters to overlap between chunks
-        
-    Yields:
-        Text chunks respecting semantic boundaries
-    """
-    # Initialize the splitter with markdown-aware separators
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=size,
-        chunk_overlap=overlap,
-        separators=["\n\n", "\n", " ", ""],  # Hierarchy: paragraphs > lines > words > characters
-        is_separator_regex=False
-    )
-    
-    # Split the text
-    chunks = splitter.split_text(text)
-    
-    # Yield each chunk
-    for chunk in chunks:
-        if chunk.strip():  # Only yield non-empty chunks
-            yield chunk
+    """Yield markdown-aware text chunks (see common.chunking.chunk_text)."""
+    return chunking.chunk_text(text, size=size, overlap=overlap)
 
 def index_text_chunk(
     text: str,
@@ -318,21 +277,14 @@ def index_text_chunk(
 
     embedding = get_embedding(text)
 
-    s3vectors_client.put_vectors(
-        vectorBucketName=VECTOR_BUCKET,
-        indexName=VECTOR_INDEX,
-        vectors=[
-            {
-                "key": vector_id,
-                "data": {"float32": [float(x) for x in embedding]},
-                "metadata": {
-                    "chunk_text": text,
-                    **metadata
-                }
-            }
-        ]
+    return vector_store.put_vector(
+        client=s3vectors_client,
+        bucket=VECTOR_BUCKET,
+        index=VECTOR_INDEX,
+        vector_id=vector_id,
+        embedding=embedding,
+        metadata={"chunk_text": text, **metadata},
     )
-    return vector_id
 
 def rewrite_query(conversation: List[Dict], user_message: str) -> str:
     """Uses LLM to turn conversational follow-ups into standalone search queries."""
@@ -370,17 +322,15 @@ def search_text_chunks(
     if not VECTOR_BUCKET or not VECTOR_INDEX:
         raise HTTPException(status_code=500, detail="VECTOR_BUCKET or VECTOR_INDEX not configured")
 
-    query_embedding =  get_embedding(query)
+    query_embedding = get_embedding(query)
 
-    response = s3vectors_client.query_vectors(
-        vectorBucketName=VECTOR_BUCKET,
-        indexName=VECTOR_INDEX,
-        queryVector={"float32": [float(x) for x in query_embedding]},
-        topK=top_k,
-        returnDistance=True,
-        returnMetadata=True
+    return vector_store.query_vectors(
+        client=s3vectors_client,
+        bucket=VECTOR_BUCKET,
+        index=VECTOR_INDEX,
+        embedding=query_embedding,
+        top_k=top_k,
     )
-    return response.get("vectors", [])
 
 def is_rag_enabled() -> bool:
     return RAG_ENABLED and bool(SAGEMAKER_ENDPOINT and VECTOR_BUCKET and VECTOR_INDEX)
@@ -618,14 +568,14 @@ async def health_check():
         "bedrock_model": BEDROCK_MODEL_ID,
         "sagemaker_endpoint_configure" : bool(SAGEMAKER_ENDPOINT),
         "s3vectors_configured" : bool(VECTOR_BUCKET and VECTOR_INDEX),
-        "rag_enabled": is_rag_enabled()
+        "rag_enabled": is_rag_enabled(),
+        "ingestion_api_enabled": LOCAL_DEV
     }
 
 @app.post("/embed", dependencies=[Depends(require_admin_api_key)])
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
-@app.post("/ingest", dependencies=[Depends(require_admin_api_key)])
 async def ingest_file(file: UploadFile = File(...)):
     filename = Path(file.filename or "").name
     if not SAFE_MD_FILENAME_PATTERN.fullmatch(filename):
@@ -672,6 +622,11 @@ async def ingest_file(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Ingestion failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Ingestion error: {str(e)}")
+
+# Production ingestion runs in the dedicated event-driven worker Lambda.
+# The synchronous /ingest endpoint is only exposed for local development.
+if LOCAL_DEV:
+    app.post("/ingest", dependencies=[Depends(require_admin_api_key)])(ingest_file)
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):

@@ -58,7 +58,18 @@ def _load_server_module(monkeypatch, tmp_path, env_overrides=None):
     monkeypatch.setattr(boto3, "client", _fake_boto3_client)
 
     # Force a clean re-import so the new environment variables take effect.
-    for name in ("server", "context", "resources", "lambda_handler"):
+    # This includes the shared `common`/`ingestion` packages, whose config is
+    # also read from the environment at import time.
+    stale = [
+        name
+        for name in sys.modules
+        if name in ("server", "context", "resources", "lambda_handler")
+        or name == "common"
+        or name.startswith("common.")
+        or name == "ingestion"
+        or name.startswith("ingestion.")
+    ]
+    for name in stale:
         sys.modules.pop(name, None)
 
     # Import as `server`, not `backend.server`

@@ -47,6 +47,7 @@ echo "📦 Emptying S3 buckets..."
 # Get bucket names with account ID (matching Day 4 naming)
 FRONTEND_BUCKET="${PROJECT_NAME}-${ENVIRONMENT}-frontend-${AWS_ACCOUNT_ID}"
 MEMORY_BUCKET="${PROJECT_NAME}-${ENVIRONMENT}-memory-${AWS_ACCOUNT_ID}"
+RAG_DOCS_BUCKET="${PROJECT_NAME}-${ENVIRONMENT}-rag-docs-${AWS_ACCOUNT_ID}"
 
 # Empty frontend bucket if it exists
 if aws s3 ls "s3://$FRONTEND_BUCKET" 2>/dev/null; then
@@ -62,6 +63,31 @@ if aws s3 ls "s3://$MEMORY_BUCKET" 2>/dev/null; then
     aws s3 rm "s3://$MEMORY_BUCKET" --recursive
 else
     echo "  Memory bucket not found or already empty"
+fi
+
+# Empty the versioned RAG source bucket (all object versions + delete markers)
+if aws s3 ls "s3://$RAG_DOCS_BUCKET" 2>/dev/null; then
+    echo "  Emptying versioned bucket $RAG_DOCS_BUCKET..."
+    aws s3 rm "s3://$RAG_DOCS_BUCKET" --recursive
+    aws s3api list-object-versions \
+        --bucket "$RAG_DOCS_BUCKET" \
+        --output json \
+        --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+        > /tmp/rag_versions.json 2>/dev/null || true
+    if [ -s /tmp/rag_versions.json ] && grep -q '"Key"' /tmp/rag_versions.json; then
+        aws s3api delete-objects --bucket "$RAG_DOCS_BUCKET" --delete file:///tmp/rag_versions.json || true
+    fi
+    aws s3api list-object-versions \
+        --bucket "$RAG_DOCS_BUCKET" \
+        --output json \
+        --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+        > /tmp/rag_markers.json 2>/dev/null || true
+    if [ -s /tmp/rag_markers.json ] && grep -q '"Key"' /tmp/rag_markers.json; then
+        aws s3api delete-objects --bucket "$RAG_DOCS_BUCKET" --delete file:///tmp/rag_markers.json || true
+    fi
+    rm -f /tmp/rag_versions.json /tmp/rag_markers.json
+else
+    echo "  RAG docs bucket not found or already empty"
 fi
 
 echo "🔥 Running terraform destroy..."

@@ -51,6 +51,16 @@ def main():
         if os.path.exists(file):
             shutil.copy2(file, "lambda-package/")
 
+    # Copy shared and ingestion packages (used by both the chat and
+    # ingestion-worker Lambda handlers, which share one deployment zip)
+    for package in ["common", "ingestion"]:
+        if os.path.exists(package):
+            shutil.copytree(
+                package,
+                f"lambda-package/{package}",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+
     # Copy data directory
     if os.path.exists("data"):
         shutil.copytree("data", "lambda-package/data")

@@ -42,18 +42,37 @@ class TestAdminGateConfigured:
         [
             ("get", "/conversation/test-session", {}),
             ("post", "/embed", {"json": {"text": "hello"}}),
-            (
-                "post",
-                "/ingest",
-                {"files": {"file": ("notes.md", b"# hi", "text/markdown")}},
-            ),
         ],
-        ids=["conversation", "embed", "ingest"],
+        ids=["conversation", "embed"],
     )
     def test_gated_endpoints_reject_without_key(self, make_server, method, path, kwargs):
         server_module = make_server(ADMIN_API_KEY=VALID_KEY, LOCAL_DEV="false")
         with TestClient(server_module.app) as client:
             resp = getattr(client, method)(path, **kwargs)
+        assert resp.status_code == 401
+
+
+class TestIngestEndpointGating:
+    """The synchronous /ingest endpoint exists only when LOCAL_DEV=true."""
+
+    def test_ingest_absent_outside_local_dev(self, make_server):
+        server_module = make_server(ADMIN_API_KEY=VALID_KEY, LOCAL_DEV="false")
+        with TestClient(server_module.app) as client:
+            resp = client.post(
+                "/ingest",
+                files={"file": ("notes.md", b"# hi", "text/markdown")},
+                headers={"x-api-key": VALID_KEY},
+            )
+        assert resp.status_code == 404
+
+    def test_ingest_present_and_gated_in_local_dev(self, make_server):
+        server_module = make_server(ADMIN_API_KEY=VALID_KEY, LOCAL_DEV="true")
+        with TestClient(server_module.app) as client:
+            resp = client.post(
+                "/ingest",
+                files={"file": ("notes.md", b"# hi", "text/markdown")},
+            )
+        # Route exists but the admin gate rejects the missing key.
         assert resp.status_code == 401
 
 

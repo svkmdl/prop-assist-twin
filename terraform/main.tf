@@ -242,7 +242,6 @@ resource "aws_iam_role_policy" "lambda_s3vectors" {
       {
         Effect = "Allow"
         Action = [
-          "s3vectors:PutVectors",
           "s3vectors:GetVectors",
           "s3vectors:QueryVectors"
         ]
@@ -329,6 +328,7 @@ resource "aws_lambda_function" "api" {
       MAX_MESSAGE_CHARS      = tostring(var.max_message_chars)
       MAX_UPLOAD_BYTES       = tostring(var.max_upload_bytes)
       INGESTION_MAX_WORKERS  = tostring(var.ingestion_max_workers)
+      EMBEDDING_MAX_ATTEMPTS = tostring(var.embedding_max_attempts)
     }
   }
 
@@ -391,12 +391,6 @@ resource "aws_apigatewayv2_route" "get_health" {
 resource "aws_apigatewayv2_route" "post_embed" {
   api_id    = aws_apigatewayv2_api.main.id
   route_key = "POST /embed"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_route" "post_ingest" {
-  api_id    = aws_apigatewayv2_api.main.id
-  route_key = "POST /ingest"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 

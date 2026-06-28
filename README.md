@@ -2,7 +2,7 @@
 
 Technical README for running and deploying the project.
 
-`prop-assist-twin` is a full-stack real-estate assistant PoC built as a digital twin experience. The frontend is a static Next.js application, the backend is a FastAPI service adapted to AWS Lambda with Mangum, and the inference layer is Amazon Bedrock with Nova models. Conversation state can be stored locally during development or in S3 in AWS deployments. The backend also includes an optional SageMaker-based embedding path exposed via `/embed`, S3 Vectors-backed RAG retrieval for `/chat`, and a markdown ingestion route exposed via `/ingest`.
+`prop-assist-twin` is a full-stack real-estate assistant PoC built as a digital twin experience. The frontend is a static Next.js application, the backend is a FastAPI service adapted to AWS Lambda with Mangum, and the inference layer is Amazon Bedrock with Nova models. Conversation state can be stored locally during development or in S3 in AWS deployments. The backend also includes an optional SageMaker-based embedding path exposed via `/embed` and S3 Vectors-backed RAG retrieval for `/chat`. Document ingestion runs as a separate event-driven pipeline (S3 → SQS → ingestion Lambda → S3 Vectors) tracked in a DynamoDB manifest; a synchronous `/ingest` route remains available for local development only.
 
 * * *
 
@@ -18,10 +18,16 @@ flowchart LR
   Lambda --> Memory[(Conversation memory: S3 or local JSON)]
   Lambda --> SageMaker[SageMaker embedding endpoint]
   Lambda --> S3Vectors[S3 Vectors index]
-  Admin[Admin ingestion client] --> APIGW
+  Admin[Admin uploads markdown] --> RagDocs[(S3 RAG source bucket)]
+  RagDocs --> SQS[SQS ingest queue]
+  SQS --> Worker[Ingestion worker Lambda]
+  Worker --> SageMaker
+  Worker --> S3Vectors
+  Worker --> Manifest[(DynamoDB ingestion manifest)]
+  SQS -. failures .-> DLQ[SQS DLQ + CloudWatch alarms]
 ```
 
-The frontend is statically exported by Next.js and served from S3 behind CloudFront. The browser calls the API Gateway URL directly. API Gateway invokes a Python Lambda package that hosts the FastAPI app through Mangum.
+The frontend is statically exported by Next.js and served from S3 behind CloudFront. The browser calls the API Gateway URL directly. API Gateway invokes a Python Lambda package that hosts the FastAPI app through Mangum. Document ingestion is decoupled from the chat path: uploading a markdown file to the RAG source bucket emits an S3 event onto an SQS queue, which a dedicated ingestion worker Lambda consumes to chunk, embed, and index the document while recording status in a DynamoDB manifest.
 
 ### AWS components
 
@@ -30,9 +36,14 @@ The frontend is statically exported by Next.js and served from S3 behind CloudFr
   * API Gateway HTTP API exposes the backend endpoints.
   * Lambda runs the FastAPI application through Mangum.
   * Amazon Bedrock Runtime handles inference using the configured Nova model.
-  * Amazon SageMaker can optionally host a serverless embedding endpoint used by `/embed` and RAG ingestion/retrieval.
+  * Amazon SageMaker can optionally host a serverless embedding endpoint used by `/embed`, RAG retrieval, and the ingestion worker.
   * S3 (memory bucket) stores conversation history in deployed environments.
   * S3 Vectors can optionally store indexed markdown chunks for RAG-backed `/chat` answers.
+  * S3 (RAG source bucket) receives raw markdown uploads under `incoming/{tenant_id}/` and emits `ObjectCreated` events.
+  * SQS queue + dead-letter queue buffer ingestion events and isolate failures.
+  * A second Lambda (ingestion worker) consumes the queue, validates, chunks, embeds, and indexes documents.
+  * DynamoDB stores the ingestion manifest for idempotency and status tracking.
+  * CloudWatch alarms watch the DLQ, worker errors, and queue age.
   * Route 53 + ACM are optional and only used when a custom domain is enabled.
 
 ---
@@ -61,11 +72,18 @@ flowchart TD
   SAVE --> RESP[Return response, sources, session_id, retrieval_used]
   RESP --> UI[Render answer and source snippets]
 
-  subgraph Ingestion[Knowledge ingestion]
-    MD[Admin markdown upload to POST /ingest] --> SAFE[Validate file size, filename, and UTF-8 markdown]
-    SAFE --> CHUNK[Chunk text with CHUNK_SIZE and CHUNK_OVERLAP]
+  subgraph Ingestion[Knowledge ingestion event-driven pipeline]
+    MD[Admin uploads markdown to S3 incoming/tenant_id/] --> EVT[S3 ObjectCreated event]
+    EVT --> SQS[SQS ingest queue]
+    SQS --> WORK[Ingestion worker Lambda]
+    WORK --> SAFE[Validate extension, size, UTF-8, and checksum]
+    SAFE --> IDEM{Already ingested? check DynamoDB manifest}
+    IDEM -- yes --> SKIP[Mark SKIPPED]
+    IDEM -- no --> CHUNK[Chunk text with CHUNK_SIZE and CHUNK_OVERLAP]
     CHUNK --> IEMB[Embed each chunk with SageMaker endpoint]
-    IEMB --> PUT[Store vector and metadata in S3 Vectors]
+    IEMB --> PUT[Store vectors with deterministic IDs and metadata in S3 Vectors]
+    PUT --> DONE[Update manifest SUCCEEDED with chunk count]
+    WORK -. transient failure .-> DLQ[Retry then SQS DLQ + alarm]
   end
 ```
 
@@ -75,7 +93,7 @@ The final Bedrock Nova call is instructed by `backend/context.py` to answer in t
 
 ## Semantic text chunking
 
-The `/ingest` endpoint uses **LangChain's `RecursiveCharacterTextSplitter`** for semantic text chunking. This respects document structure before falling back to character-based splitting, ensuring better RAG retrieval quality by maintaining semantic coherence within chunks.
+Both the ingestion worker and the local `/ingest` endpoint use **LangChain's `RecursiveCharacterTextSplitter`** for semantic text chunking. This respects document structure before falling back to character-based splitting, ensuring better RAG retrieval quality by maintaining semantic coherence within chunks.
 
 ### Splitting hierarchy
 
@@ -137,12 +155,63 @@ This results in more relevant RAG retrieval compared to naive character-based sp
 
 * * *
 
+## Event-driven ingestion pipeline
+
+In deployed environments, document ingestion is fully decoupled from the chat Lambda. The chat Lambda only **reads** from S3 Vectors (`QueryVectors`/`GetVectors`); a separate ingestion worker Lambda **writes** vectors. The two Lambdas share one deployment zip but use different handlers and IAM roles.
+
+### Flow
+
+1. An admin uploads a markdown file to the RAG source bucket under `incoming/{tenant_id}/{document}.md`.
+2. The S3 `ObjectCreated` event (filtered to the `incoming/` prefix and `.md` suffix) is delivered to an SQS queue.
+3. The ingestion worker Lambda consumes the queue (batch size 1, partial-batch failure reporting enabled) and for each document:
+   - reads the object from S3 and validates extension, size, and UTF-8 content,
+   - computes a SHA-256 checksum and checks the DynamoDB manifest for idempotency,
+   - chunks the content, embeds each chunk via the SageMaker endpoint, and writes vectors to S3 Vectors with deterministic IDs,
+   - updates the manifest status and chunk count.
+
+### Failure handling
+
+| Scenario | Behavior |
+| --- | --- |
+| Invalid file (bad extension, non-UTF-8, empty, too large) | Manifest marked `FAILED`; message acknowledged (no retry) |
+| Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing |
+| Embedding or vector-write failure | Message retried via SQS; after `max_receive_count`, routed to the DLQ |
+| Throttling from the serverless embedding endpoint | Absorbed by adaptive botocore retries (`EMBEDDING_MAX_ATTEMPTS`) |
+
+### Vector IDs and metadata
+
+Vectors use deterministic IDs of the form `{tenant_id}/{doc_id}/{source_version_or_sha256}/{chunk_index}`, so retries safely overwrite the same chunks. Each vector stores `tenant_id`, `source_bucket`, `source_key`, `source_version`, `title`, `doc_type`, `chunk_index`, `chunk_text`, `embedding_model`, and `ingested_at`.
+
+### DynamoDB manifest
+
+The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `SKIPPED`.
+
+### Observability
+
+Three CloudWatch alarms cover the pipeline: DLQ message count, worker Lambda errors, and queue age (oldest message). Set `alarm_sns_topic_arn` to receive notifications; otherwise alarms are visible in the console only.
+
+### Local development
+
+The synchronous `POST /ingest` endpoint still exists, but it is only registered when `LOCAL_DEV=true`. It exercises the same chunking/embedding/indexing logic in-process for quick local testing and is not exposed through API Gateway in deployed environments.
+
+* * *
+
 ## Repository layout
 
 ```text
 .
 ├── .github/workflows/deploy.yml      # GitHub Actions deployment pipeline
 ├── backend/
+│   ├── common/                        # Shared, client-agnostic logic (no FastAPI)
+│   │   ├── chunking.py                # Markdown-aware text splitting
+│   │   ├── embeddings.py              # SageMaker embedding invocation
+│   │   ├── vector_store.py            # S3 Vectors put/query helpers
+│   │   ├── config.py                  # Env-driven config for the worker
+│   │   └── models.py                  # Shared pydantic models (SourceItem)
+│   ├── ingestion/                     # Event-driven ingestion worker Lambda
+│   │   ├── worker.py                  # SQS handler with partial-batch failures
+│   │   ├── ingest_document.py         # Read, validate, chunk, embed, index one doc
+│   │   └── manifest.py                # DynamoDB ingestion-status access
 │   ├── data/kb/                      # Markdown knowledge base for ingestion
 │   │   ├── areas.md
 │   │   ├── buying_process.md
@@ -150,12 +219,12 @@ This results in more relevant RAG retrieval compared to naive character-based sp
 │   │   ├── property-listings.md
 │   │   └── service_areas.md
 │   ├── evals/golden_chat_cases.jsonl # Golden cases for AI smoke evaluation
-│   ├── tests/                        # Pytest coverage for API and retrieval helpers
+│   ├── tests/                        # Pytest coverage for API, retrieval, and ingestion
 │   ├── context.py                    # Persona, grounding, and query rewrite prompts
-│   ├── deploy.py                     # Lambda package builder
+│   ├── deploy.py                     # Lambda package builder (shared by both Lambdas)
 │   ├── eval_chat.py                  # Chat evaluation runner
-│   ├── lambda_handler.py             # Mangum Lambda entrypoint
-│   ├── server.py                     # FastAPI app, RAG, ingestion, chat, memory
+│   ├── lambda_handler.py             # Mangum Lambda entrypoint (chat)
+│   ├── server.py                     # FastAPI app, RAG, chat, memory
 │   ├── pyproject.toml
 │   ├── requirements.txt
 │   └── uv.lock
@@ -167,7 +236,7 @@ This results in more relevant RAG retrieval compared to naive character-based sp
 ├── scripts/
 │   ├── deploy.sh                     # Build, Terraform apply, frontend sync
 │   └── destroy.sh                    # Empty buckets and Terraform destroy
-├── terraform/                        # AWS infrastructure
+├── terraform/                        # AWS infrastructure (ingestion.tf holds the pipeline)
 └── README.md
 ```
 
@@ -185,6 +254,7 @@ This results in more relevant RAG retrieval compared to naive character-based sp
 | Text chunking | LangChain `RecursiveCharacterTextSplitter` for semantic document chunking |
 | Embeddings | Optional SageMaker serverless Hugging Face endpoint |
 | Vector store | Optional S3 Vectors bucket and index |
+| Ingestion pipeline | S3 event → SQS (+ DLQ) → ingestion worker Lambda → S3 Vectors, with DynamoDB manifest |
 | Session memory | Local JSON files or S3 object storage |
 | Infrastructure | Terraform, API Gateway HTTP API, Lambda, S3, CloudFront |
 | CI/CD | GitHub Actions, OIDC to AWS, Terraform, uv, npm |
@@ -281,6 +351,10 @@ curl -X POST http://localhost:8000/ingest \
   -F "file=@data/kb/company_faq.md"
 ```
 
+> The `/ingest` route is only available when `LOCAL_DEV=true`. In deployed
+> environments, ingest documents by uploading them to the RAG source bucket
+> (see [RAG knowledge ingestion](#rag-knowledge-ingestion)).
+
 Run tests:
 
 ```bash
@@ -288,8 +362,9 @@ uv run pytest -q
 ```
 
 Tests run with coverage enabled. The suite enforces a minimum coverage
-threshold of 90% on `server.py` (configured via `fail_under` in
-`backend/pyproject.toml`); `uv run pytest` fails if coverage drops below it.
+threshold of 90% across `server.py`, `common/`, and `ingestion/` (configured via
+`fail_under` in `backend/pyproject.toml`); `uv run pytest` fails if coverage
+drops below it.
 
 Run the golden chat evaluation against a deployed or local API:
 
@@ -330,9 +405,9 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run build
 | `USE_S3` | no | `true` | Store conversation memory in S3 when true |
 | `S3_BUCKET` | when `USE_S3=true` | empty | Bucket for conversation memory |
 | `MEMORY_DIR` | when `USE_S3=false` | `../memory` | Local conversation memory directory |
-| `SAGEMAKER_ENDPOINT` | for `/embed`, `/ingest`, RAG | empty | Embedding endpoint name |
-| `VECTOR_BUCKET` | for `/ingest`, RAG | empty | S3 Vectors bucket name |
-| `VECTOR_INDEX` | for `/ingest`, RAG | empty | S3 Vectors index name |
+| `SAGEMAKER_ENDPOINT` | for `/embed`, ingestion, RAG | empty | Embedding endpoint name |
+| `VECTOR_BUCKET` | for ingestion, RAG | empty | S3 Vectors bucket name |
+| `VECTOR_INDEX` | for ingestion, RAG | empty | S3 Vectors index name |
 | `RAG_ENABLED` | no | `true` | Enables retrieval when embedding and vector dependencies exist |
 | `RAW_FETCH_SIZE` | no | `12` | Raw vector candidates fetched before reranking |
 | `FINAL_TOP_K` | no | `3` | Final source chunks passed to the answer model and returned to frontend |
@@ -342,11 +417,24 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run build
 | `SOURCE_SNIPPET_CHARS` | no | `280` | Maximum snippet length returned per source |
 | `CHUNK_SIZE` | no | `1500` | Target chunk size in characters for semantic chunking (markdown-aware with sentence fallback) |
 | `CHUNK_OVERLAP` | no | `200` | Character overlap between consecutive chunks for context continuity |
-| `ADMIN_API_KEY` | for deployed admin routes | empty | Shared admin key for `/embed`, `/ingest`, and `/conversation/{session_id}` |
-| `LOCAL_DEV` | no | `false` | Allows admin endpoints without a key only when no admin key is set |
+| `EMBEDDING_MAX_ATTEMPTS` | no | `10` | Max adaptive botocore retries for SageMaker `InvokeEndpoint` (absorbs serverless throttling) |
+| `ADMIN_API_KEY` | for deployed admin routes | empty | Shared admin key for `/embed` and `/conversation/{session_id}` (and local `/ingest`) |
+| `LOCAL_DEV` | no | `false` | Allows admin endpoints without a key when no admin key is set, and registers the local `/ingest` route |
 | `MAX_MESSAGE_CHARS` | no | `3000` | Maximum incoming chat message length |
 | `MAX_UPLOAD_BYTES` | no | `1048576` | Maximum markdown upload size for ingestion |
 | `LOG_LEVEL` | no | `INFO` | Backend logging level |
+
+### Ingestion worker Lambda
+
+The ingestion worker shares the backend deployment package but is configured independently. In addition to the shared embedding/vector/chunking variables above, it uses:
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `MANIFEST_TABLE` | yes | empty | DynamoDB ingestion manifest table name |
+| `RAG_DOCS_BUCKET` | no | empty | S3 source bucket name (informational) |
+| `EMBEDDING_MODEL` | no | `sentence-transformers/all-MiniLM-L6-v2` | Model name recorded in vector metadata |
+| `INGESTION_MAX_WORKERS` | no | `4` | Per-document embedding fan-out (keep ≤ endpoint max concurrency) |
+| `EMBEDDING_MAX_ATTEMPTS` | no | `10` | Adaptive retry budget for embedding throttling |
 
 ### Frontend
 
@@ -426,6 +514,18 @@ chunk_overlap = 200
 max_message_chars = 3000
 max_upload_bytes = 1048576
 log_level = "INFO"
+
+# Event-driven ingestion pipeline
+rag_ingest_enabled = true
+rag_ingest_lambda_timeout = 300
+rag_ingest_lambda_memory = 1024
+rag_ingest_reserved_concurrency = 3
+rag_ingest_max_receive_count = 5
+rag_ingest_batch_size = 1
+rag_ingest_queue_age_alarm_seconds = 900
+alarm_sns_topic_arn = ""
+ingestion_max_workers = 2
+embedding_max_attempts = 10
 ```
 
 Pass `admin_api_key` through `TF_VAR_admin_api_key` or a secure variable source rather than committing it to `terraform.tfvars`.
@@ -469,20 +569,19 @@ Required GitHub secrets:
 
 ## RAG knowledge ingestion
 
-The repository includes seed markdown knowledge under `backend/data/kb`. To index it against a running API with admin auth:
+The repository includes seed markdown knowledge under `backend/data/kb`. In a deployed environment, ingest it by uploading the files to the RAG source bucket under `incoming/{tenant_id}/`. Each upload triggers the event-driven pipeline, and you can track progress in the DynamoDB manifest table.
 
 ```bash
+RAG_DOCS_BUCKET=$(terraform -chdir=terraform output -raw rag_docs_bucket)
+TENANT_ID=tenant-a
+
 cd backend
 for file in data/kb/*.md; do
-  curl -X POST "$API_BASE_URL/ingest" \
-    -H "x-api-key: $ADMIN_API_KEY" \
-    -F "file=@${file}"
+  aws s3 cp "$file" "s3://${RAG_DOCS_BUCKET}/incoming/${TENANT_ID}/$(basename "$file")"
 done
 ```
 
-Only markdown uploads with safe filenames are accepted. The backend validates file size and UTF-8 content before chunking and embedding.
-
-**Chunking strategy**: Documents are processed through LangChain's `RecursiveCharacterTextSplitter` (see [Semantic text chunking](#semantic-text-chunking)) which respects paragraph breaks, line breaks, and word boundaries before falling back to character-based splitting. This produces more coherent chunks, resulting in better vector embeddings and more accurate RAG retrieval.
+Only markdown files uploaded under `incoming/` with a `.md` suffix trigger ingestion. The worker validates file size and UTF-8 content, deduplicates by version/checksum, and records status in the manifest. For quick local testing you can instead use the synchronous `POST /ingest` route with `LOCAL_DEV=true`.
 
 * * *
 
@@ -528,9 +627,9 @@ Response shape:
 
 Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `ADMIN_API_KEY` is configured.
 
-### `POST /ingest` admin
+### `POST /ingest` admin (local only)
 
-Accepts a markdown upload, applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata to S3 Vectors. Requires `x-api-key` when `ADMIN_API_KEY` is configured. See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
+Accepts a markdown upload, applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata to S3 Vectors. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
 
 ### `GET /conversation/{session_id}` admin
 
@@ -544,7 +643,9 @@ Reads stored conversation history for a session. This route exists in the FastAP
 - The default final model is `eu.amazon.nova-pro-v1:0`; the default rewrite model is `eu.amazon.nova-micro-v1:0`.
 - RAG only runs when `RAG_ENABLED=true` and `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, and `VECTOR_INDEX` are all configured.
 - `POST /chat` still works without RAG; it simply skips retrieval and answers from the base prompt plus conversation history.
-- `POST /embed` and `POST /ingest` will fail if no SageMaker embedding endpoint is configured.
-- `POST /ingest` and RAG retrieval require S3 Vectors configuration.
-- In local development, set `LOCAL_DEV=true` with an empty `ADMIN_API_KEY` to avoid blocking yourself on admin-only routes.
+- `POST /embed` and the local `POST /ingest` route will fail if no SageMaker embedding endpoint is configured.
+- The event-driven ingestion pipeline and RAG retrieval require S3 Vectors configuration; the pipeline additionally requires `rag_ingest_enabled = true` (along with `s3vectors_enabled` and `sagemaker_embedding_enabled`).
+- Keep `ingestion_max_workers` at or below `sagemaker_embedding_max_concurrency` to avoid self-inflicted `InvokeEndpoint` throttling; transient throttling is otherwise absorbed by `EMBEDDING_MAX_ATTEMPTS` adaptive retries.
+- Ingestion failures land in the SQS DLQ. Inspect the DynamoDB manifest for the `FAILED` reason, fix the document, and either re-upload it or redrive the DLQ.
+- In local development, set `LOCAL_DEV=true` with an empty `ADMIN_API_KEY` to avoid blocking yourself on admin-only routes (this also enables the local `/ingest` route).
 - In deployed environments, always set a non-empty `ADMIN_API_KEY` and send it as `x-api-key` for admin routes.

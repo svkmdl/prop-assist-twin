@@ -237,3 +237,59 @@ variable "ingestion_max_workers" {
   type        = number
   default     = 4
 }
+
+variable "embedding_max_attempts" {
+  description = "Max botocore (adaptive) retry attempts for SageMaker InvokeEndpoint, to absorb serverless-endpoint throttling."
+  type        = number
+  default     = 10
+}
+
+# --- Event-driven RAG ingestion pipeline ---
+
+variable "rag_ingest_enabled" {
+  description = "Create the event-driven RAG ingestion pipeline (S3 -> SQS -> Lambda -> DynamoDB + S3 Vectors). Requires s3vectors_enabled and sagemaker_embedding_enabled."
+  type        = bool
+  default     = false
+}
+
+variable "rag_ingest_lambda_timeout" {
+  description = "Ingestion worker Lambda timeout in seconds"
+  type        = number
+  default     = 300
+}
+
+variable "rag_ingest_lambda_memory" {
+  description = "Ingestion worker Lambda memory size in MB"
+  type        = number
+  default     = 1024
+}
+
+variable "rag_ingest_reserved_concurrency" {
+  description = "Reserved concurrency for the ingestion worker Lambda"
+  type        = number
+  default     = 3
+}
+
+variable "rag_ingest_max_receive_count" {
+  description = "Number of delivery attempts before a message is routed to the DLQ"
+  type        = number
+  default     = 5
+}
+
+variable "rag_ingest_batch_size" {
+  description = "Number of SQS messages delivered to the ingestion worker per invocation"
+  type        = number
+  default     = 1
+}
+
+variable "rag_ingest_queue_age_alarm_seconds" {
+  description = "Alarm threshold for the age (seconds) of the oldest message in the ingestion queue"
+  type        = number
+  default     = 900
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "Optional SNS topic ARN to notify on ingestion CloudWatch alarms. Empty disables notifications (alarms still visible in the console)."
+  type        = string
+  default     = ""
+}
