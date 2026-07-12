@@ -44,7 +44,7 @@ def test_retrieve_sources_reranks_and_diversifies(server_module, monkeypatch):
 
     # Monkeypatch settings for the test
     monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
-    monkeypatch.setattr(server_module, "search_text_chunks", lambda query, top_k: raw_hits)
+    monkeypatch.setattr(server_module, "search_text_chunks", lambda query, top_k, metadata_filter=None: raw_hits)
 
     # Set the new funnel constants
     monkeypatch.setattr(server_module, "RAW_FETCH_SIZE", 5)
@@ -78,3 +78,37 @@ def test_retrieve_sources_reranks_and_diversifies(server_module, monkeypatch):
     doc4 = next(s for s in sources if s.id == "doc-4")
     assert doc4.snippet.endswith("…")
     assert len(doc4.snippet) <= server_module.SOURCE_SNIPPET_CHARS
+
+
+def test_retrieve_sources_applies_tenant_filter(server_module, monkeypatch):
+    """retrieve_sources forwards a tenant filter when tenant_id is a real tenant."""
+    captured_filter = {}
+
+    def fake_search(query, top_k, metadata_filter=None):
+        captured_filter["value"] = metadata_filter
+        return []
+
+    monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
+    monkeypatch.setattr(server_module, "search_text_chunks", fake_search)
+
+    server_module.retrieve_sources("query", tenant_id="T001")
+    assert captured_filter["value"] == {"tenant_id": {"$eq": "T001"}}
+
+
+def test_retrieve_sources_no_filter_for_admin(server_module, monkeypatch):
+    """retrieve_sources passes no filter for the admin (default) tenant."""
+    captured_filter = {}
+
+    def fake_search(query, top_k, metadata_filter=None):
+        captured_filter["value"] = metadata_filter
+        return []
+
+    monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
+    monkeypatch.setattr(server_module, "search_text_chunks", fake_search)
+
+    server_module.retrieve_sources("query", tenant_id="admin")
+    assert captured_filter["value"] is None
+
+    # Passing None explicitly should also result in no filter.
+    server_module.retrieve_sources("query", tenant_id=None)
+    assert captured_filter["value"] is None

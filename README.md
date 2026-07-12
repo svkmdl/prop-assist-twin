@@ -62,7 +62,7 @@ flowchart TD
   Q --> RAG{RAG enabled and dependencies configured?}
   RAG -- no --> BASE[Base prompt from backend/context.py]
   RAG -- yes --> EMB[Embed query with SageMaker endpoint]
-  EMB --> VEC[Query S3 Vectors for RAW_FETCH_SIZE candidates]
+  EMB --> VEC[Query S3 Vectors for RAW_FETCH_SIZE candidates, filtered by tenant_id for non-admin tenants]
   VEC --> RERANK[Apply distance cutoff, lexical rerank, and per-document cap]
   RERANK --> SRC[Select FINAL_TOP_K source snippets]
   SRC --> BLOCK[Append RETRIEVED KNOWLEDGE block with S1/S2 citation rules]
@@ -88,6 +88,8 @@ flowchart TD
 ```
 
 `/chat` is a grounded generation pipeline with a small query-rewrite step in front of retrieval. The backend keeps recent chat state, rewrites follow-up questions into standalone search queries when needed, retrieves candidate chunks from S3 Vectors, reranks them with distance and lexical overlap signals, caps repeated chunks from the same document, and injects the selected snippets into the model prompt as a `RETRIEVED KNOWLEDGE` block.
+
+Retrieval is tenant-aware. Each request carries an optional `tenant_id` (defaulting to `admin`); for real tenants (`T001`, `T002`) the vector query is scoped with an S3 Vectors metadata filter (`{"tenant_id": {"$eq": ...}}`) so a session only sees its own documents, while `admin` queries across all tenants. The tenant is fixed to a session on its first turn and persisted alongside the conversation, so later turns cannot switch tenants.
 
 The final Bedrock Nova call is instructed by `backend/context.py` to answer in the user's language, use retrieved sources for company/listing/process/policy facts, and cite only the injected `[S#]` snippets. If RAG is disabled or the embedding/vector dependencies are missing, the app falls back to normal prompt-only Bedrock chat while still preserving session memory.
 
@@ -598,9 +600,18 @@ Request:
 ```json
 {
   "message": "Which properties are available in Berlin?",
-  "session_id": "optional-existing-session"
+  "session_id": "optional-existing-session",
+  "tenant_id": "T001"
 }
 ```
+
+`tenant_id` is optional and defaults to `admin`. Allowed values are `T001`,
+`T002`, and `admin`; any other value is rejected with `422`. Real tenants
+(`T001`, `T002`) scope vector retrieval to their own documents via an S3 Vectors
+metadata filter, while `admin` queries across all tenants (no filter). The
+tenant is bound to the session on its first turn: once a session exists, its
+stored tenant is authoritative and a differing `tenant_id` on later turns is
+ignored.
 
 Response shape:
 
@@ -608,6 +619,7 @@ Response shape:
 {
   "response": "...",
   "session_id": "...",
+  "tenant_id": "T001",
   "sources": [
     {
       "id": "company_faq-0",

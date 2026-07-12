@@ -84,7 +84,7 @@ CONVERSATION_SCENARIOS = [
 def test_chat_conversation_scenarios(
     client, server_module, monkeypatch, session_id, turns
 ):
-    def fake_retrieve_sources(message: str):
+    def fake_retrieve_sources(message: str, tenant_id=None):
         return [
             server_module.SourceItem(**data)
             for data in STUBBED_SOURCES.get(message, [])
@@ -108,6 +108,7 @@ def test_chat_conversation_scenarios(
         body = response.json()
 
         assert body["session_id"] == session_id
+        assert body["tenant_id"] == "admin"  # default tenant
         assert body["response"] == (
             f"stub::{turn['message']}::history={turn['expected_history']}"
             f"::sources={turn['expected_sources']}"
@@ -159,7 +160,9 @@ class TestS3StorageBranch:
                 )
 
         sm.s3_client = FakeS3()
-        assert sm.load_conversation("sess") == []
+        stored_tenant, msgs = sm.load_conversation("sess")
+        assert stored_tenant is None
+        assert msgs == []
 
     def test_save_then_load_roundtrip(self, make_server):
         sm = make_server(USE_S3="true", S3_BUCKET="bucket")
@@ -175,4 +178,5 @@ class TestS3StorageBranch:
         sm.s3_client = FakeS3()
         messages = [{"role": "user", "content": "hi", "timestamp": "t"}]
         sm.save_conversation("sess", messages)
-        assert sm.load_conversation("sess") == messages
+        _, loaded = sm.load_conversation("sess")
+        assert loaded == messages

@@ -98,7 +98,7 @@ class TestRetrieveSourcesDistanceFilter:
             },
         ]
         monkeypatch.setattr(
-            server_module, "search_text_chunks", lambda query, top_k: hits
+            server_module, "search_text_chunks", lambda query, top_k, metadata_filter=None: hits
         )
 
         sources = server_module.retrieve_sources("balcony")

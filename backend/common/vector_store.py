@@ -4,7 +4,7 @@ Both the chat API (queries) and the ingestion worker (writes) share these
 primitives. Clients, bucket, and index are passed explicitly so callers own
 their own boto3 ``s3vectors`` client.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def put_vector(
@@ -50,6 +50,7 @@ def query_vectors(
     index: str,
     embedding: List[float],
     top_k: int,
+    metadata_filter: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Query an S3 Vectors index and return the matched vectors.
 
@@ -59,11 +60,14 @@ def query_vectors(
         index: The vector index name.
         embedding: The query embedding vector.
         top_k: Number of nearest neighbours to return.
+        metadata_filter: Optional S3 Vectors metadata filter expression
+            (e.g. ``{"tenant_id": {"$eq": "T001"}}``).  When *None* no
+            filter is applied and all vectors are eligible.
 
     Returns:
         The list of matched vector dicts (possibly empty).
     """
-    response = client.query_vectors(
+    kwargs: Dict[str, Any] = dict(
         vectorBucketName=bucket,
         indexName=index,
         queryVector={"float32": [float(x) for x in embedding]},
@@ -71,4 +75,7 @@ def query_vectors(
         returnDistance=True,
         returnMetadata=True,
     )
+    if metadata_filter is not None:
+        kwargs["filter"] = metadata_filter
+    response = client.query_vectors(**kwargs)
     return response.get("vectors", [])

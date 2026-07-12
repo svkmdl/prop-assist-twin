@@ -40,3 +40,7 @@ MANIFEST_TABLE = os.getenv("MANIFEST_TABLE", "")
 RAG_DOCS_BUCKET = os.getenv("RAG_DOCS_BUCKET", "")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Tenant configuration
+ALLOWED_TENANT_IDS = ["T001", "T002", "admin"]
+DEFAULT_TENANT_ID = "admin"

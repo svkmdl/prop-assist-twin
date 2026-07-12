@@ -1,13 +1,13 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import os
 import logging
 import re
 import hmac
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -125,10 +125,24 @@ class ChatRequest(BaseModel):
         pattern=SESSION_ID_PATTERN,
         max_length=64
     )
+    tenant_id: str = Field(
+        default=config.DEFAULT_TENANT_ID,
+        pattern=r"^[A-Za-z0-9_-]{1,32}$",
+    )
+
+    @field_validator("tenant_id")
+    @classmethod
+    def validate_tenant_id(cls, v: str) -> str:
+        if v not in config.ALLOWED_TENANT_IDS:
+            raise ValueError(
+                f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}"
+            )
+        return v
 
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+    tenant_id: str
     sources: List[SourceItem] = Field(default_factory=list) # List of source objects; defaults to a fresh empty list
     retrieval_used: bool = False
 
@@ -146,32 +160,43 @@ def get_memory_path(session_id: str) -> str:
     safe_session_id = normalize_session_id(session_id)
     return f"sessions/{safe_session_id}.json"
 
-def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from storage"""
+def load_conversation(session_id: str) -> Tuple[Optional[str], List[Dict]]:
+    """Load conversation history from storage.
+
+    Returns:
+        A ``(stored_tenant_id, messages)`` tuple.  ``stored_tenant_id`` is
+        *None* when the session does not exist yet (new session).
+    """
     if USE_S3:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
-            return json.loads(response["Body"].read().decode("utf-8"))
+            raw = json.loads(response["Body"].read().decode("utf-8"))
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                return []
+                return None, []
             raise
     else:
         # Local file storage
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                return json.load(f)
-        return []
+        if not os.path.exists(file_path):
+            return None, []
+        with open(file_path, "r") as f:
+            raw = json.load(f)
 
-def save_conversation(session_id: str, messages: List[Dict]):
+    # Support both legacy format (plain list) and new format ({tenant_id, messages})
+    if isinstance(raw, list):
+        return None, raw
+    return raw.get("tenant_id"), raw.get("messages", [])
+
+def save_conversation(session_id: str, messages: List[Dict], tenant_id: str = config.DEFAULT_TENANT_ID):
     """Save conversation history to storage"""
+    data = {"tenant_id": tenant_id, "messages": messages}
     if USE_S3:
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=get_memory_path(session_id),
-            Body=json.dumps(messages, indent=2),
+            Body=json.dumps(data, indent=2),
             ContentType="application/json",
         )
     else:
@@ -179,7 +204,7 @@ def save_conversation(session_id: str, messages: List[Dict]):
         os.makedirs(MEMORY_DIR, exist_ok=True)
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
-            json.dump(messages, f, indent=2)
+            json.dump(data, f, indent=2)
 
 def normalize_session_id(session_id: str) -> str:
     if not re.fullmatch(SESSION_ID_PATTERN, session_id):
@@ -318,7 +343,8 @@ def rewrite_query(conversation: List[Dict], user_message: str) -> str:
 
 def search_text_chunks(
     query: str,
-    top_k: int = 5
+    top_k: int = 5,
+    metadata_filter: Optional[Dict] = None,
 ) -> List[Dict]:
     if not VECTOR_BUCKET or not VECTOR_INDEX:
         raise HTTPException(status_code=500, detail="VECTOR_BUCKET or VECTOR_INDEX not configured")
@@ -331,6 +357,7 @@ def search_text_chunks(
         index=VECTOR_INDEX,
         embedding=query_embedding,
         top_k=top_k,
+        metadata_filter=metadata_filter,
     )
 
 def is_rag_enabled() -> bool:
@@ -407,21 +434,33 @@ def get_lexical_score(query: str, document: str) -> float:
 def retrieve_sources(
         query: str,
         fetch_n: int = RAW_FETCH_SIZE,
-        return_n: int = FINAL_TOP_K
+        return_n: int = FINAL_TOP_K,
+        tenant_id: Optional[str] = None,
 ) -> List[SourceItem]:
     """
         Retrieves sources using a two-stage process:
         1. Fetch a large candidate pool (fetch_n).
         2. Rerank by combined score and limit per-document chunks.
+
+        ``tenant_id`` scopes the vector search to a single tenant when provided
+        and not equal to the default admin value.  Pass *None* or the admin
+        tenant to query across all tenants.
     """
 
     if not is_rag_enabled():
         logger.info("retrieval disabled")
         return []
 
+    # Build metadata filter only for non-admin tenants
+    metadata_filter: Optional[Dict] = (
+        {"tenant_id": {"$eq": tenant_id}}
+        if tenant_id and tenant_id != config.DEFAULT_TENANT_ID
+        else None
+    )
+
     try:
         # The "Wide Net" fetch from Vector DB
-        raw_results = search_text_chunks(query, top_k=fetch_n)
+        raw_results = search_text_chunks(query, top_k=fetch_n, metadata_filter=metadata_filter)
         logger.info(f"Vector DB returned {len(raw_results)} raw candidates.")
     except Exception as exc:
         logger.error(f"Vector search failed: {exc}", exc_info=True)
@@ -636,14 +675,20 @@ async def chat(request: ChatRequest):
         # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
 
-        # Load conversation history
-        conversation = load_conversation(session_id)
+        # Load conversation history; resolve effective tenant from stored session
+        stored_tenant_id, conversation = load_conversation(session_id)
+        # For a new session use the request's tenant; for an existing session
+        # always honour the tenant that was stored at creation time to prevent
+        # mid-session tenant switching.
+        effective_tenant_id = (
+            stored_tenant_id if stored_tenant_id is not None else request.tenant_id
+        )
 
         # Determine the search query (using history if it exists)
         search_query = rewrite_query(conversation, request.message)
 
-        # Retrieve sources
-        sources = retrieve_sources(search_query)
+        # Retrieve sources scoped to the effective tenant
+        sources = retrieve_sources(search_query, tenant_id=effective_tenant_id)
 
         # Call Bedrock for response
         assistant_response = call_bedrock(
@@ -664,12 +709,13 @@ async def chat(request: ChatRequest):
             }
         )
 
-        # Save conversation
-        save_conversation(session_id, conversation)
+        # Save conversation with the effective tenant
+        save_conversation(session_id, conversation, tenant_id=effective_tenant_id)
 
         return ChatResponse(
             response=assistant_response,
             session_id=session_id,
+            tenant_id=effective_tenant_id,
             sources=sources,
             retrieval_used=bool(sources)
         )
@@ -684,7 +730,7 @@ async def chat(request: ChatRequest):
 async def get_conversation(session_id: str):
     """Retrieve conversation history"""
     try:
-        conversation = load_conversation(session_id)
+        _, conversation = load_conversation(session_id)
         return {"session_id": session_id, "messages": conversation}
     except HTTPException:
         raise

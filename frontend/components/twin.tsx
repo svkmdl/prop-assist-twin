@@ -16,6 +16,7 @@ interface SourceItem {
 interface ChatResponse {
   response: string;
   session_id: string;
+  tenant_id: string;
   sources?: SourceItem[];
   retrieval_used?: boolean;
 }
@@ -33,6 +34,8 @@ export default function Twin() {
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
+    const [tenantId, setTenantId] = useState<string>('T001');
+    const [isTenantLocked, setIsTenantLocked] = useState<boolean>(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -66,6 +69,7 @@ export default function Twin() {
                 body: JSON.stringify({
                     message: input,
                     session_id: sessionId || undefined,
+                    tenant_id: tenantId,
                 }),
             });
 
@@ -75,6 +79,7 @@ export default function Twin() {
 
             if (!sessionId) {
                 setSessionId(data.session_id);
+                setIsTenantLocked(true);
             }
 
             const assistantMessage: Message = {
@@ -221,6 +226,28 @@ export default function Twin() {
 
             {/* Input */}
             <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
+                {/* Tenant selector */}
+                <div className="flex items-center gap-2 mb-3">
+                    <label
+                        htmlFor="tenant-select"
+                        className="text-xs font-medium text-gray-500 whitespace-nowrap"
+                    >
+                        Tenant
+                    </label>
+                    <select
+                        id="tenant-select"
+                        value={tenantId}
+                        onChange={(e) => setTenantId(e.target.value)}
+                        disabled={isTenantLocked || isLoading}
+                        className="text-xs px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-600 disabled:opacity-50 disabled:cursor-not-allowed bg-white text-gray-700"
+                    >
+                        <option value="T001">T001</option>
+                        <option value="T002">T002</option>
+                    </select>
+                    {isTenantLocked && (
+                        <span className="text-xs text-slate-400 italic">Session active</span>
+                    )}
+                </div>
                 <div className="flex gap-2">
                     <input
                         type="text"
