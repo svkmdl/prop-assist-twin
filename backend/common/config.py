@@ -25,6 +25,11 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
 INGESTION_MAX_WORKERS = max(1, min(8, int(os.getenv("INGESTION_MAX_WORKERS", "4"))))
 
+# Supported upload file extensions (comma-separated env var, e.g. ".md,.txt")
+SUPPORTED_SUFFIXES: frozenset = frozenset(
+    s.strip() for s in os.getenv("SUPPORTED_SUFFIXES", ".md").split(",") if s.strip()
+)
+
 # SageMaker invocation resilience. The serverless embedding endpoint has a
 # small max-concurrency, so concurrent InvokeEndpoint calls can be throttled.
 # Adaptive retries with a generous attempt budget smooth out those bursts.

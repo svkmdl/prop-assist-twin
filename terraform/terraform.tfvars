@@ -36,6 +36,7 @@ chunk_size             = 1500
 chunk_overlap          = 200
 max_message_chars      = 3000
 max_upload_bytes       = 1048576
+supported_suffixes     = [".md"]
 # Keep the per-document embedding fan-out at/below the serverless endpoint's
 # max-concurrency (sagemaker_embedding_max_concurrency) to avoid self-inflicted
 # InvokeEndpoint throttling. Cross-invocation bursts are absorbed by adaptive

@@ -14,8 +14,6 @@ from ingestion import manifest
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUFFIX = ".md"
-
 # Lazily-created, cached boto3 clients (one set per warm Lambda container).
 _s3_client = None
 _sagemaker_client = None
@@ -78,7 +76,8 @@ def parse_source_key(source_key: str) -> Tuple[str, str, str]:
     if not tenant_id or not filename:
         raise InvalidDocumentError(f"Unexpected source key layout: {source_key}")
 
-    doc_id = filename[: -len(SUPPORTED_SUFFIX)] if filename.endswith(SUPPORTED_SUFFIX) else filename
+    matched = next((s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)), None)
+    doc_id = filename[: -len(matched)] if matched else filename
     return tenant_id, doc_id, filename
 
 
@@ -88,8 +87,9 @@ def _validate(source_key: str, body_bytes: bytes) -> str:
     Raises:
         InvalidDocumentError: on any validation failure.
     """
-    if not source_key.endswith(SUPPORTED_SUFFIX):
-        raise InvalidDocumentError("Unsupported extension; only .md is allowed")
+    if not any(source_key.endswith(s) for s in config.SUPPORTED_SUFFIXES):
+        allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
+        raise InvalidDocumentError(f"Unsupported extension; allowed: {allowed}")
     if len(body_bytes) == 0:
         raise InvalidDocumentError("File is empty")
     if len(body_bytes) > config.MAX_UPLOAD_BYTES:
@@ -106,6 +106,7 @@ def _index_chunk(
     chunk: str,
     tenant_id: str,
     doc_id: str,
+    doc_type: str,
     source_bucket: str,
     source_key: str,
     source_version: str,
@@ -122,7 +123,7 @@ def _index_chunk(
         "source_key": source_key,
         "source_version": source_version,
         "title": doc_id,
-        "doc_type": SUPPORTED_SUFFIX,
+        "doc_type": doc_type,
         "chunk_index": chunk_index,
         "chunk_text": chunk,
         "embedding_model": config.EMBEDDING_MODEL,
@@ -174,6 +175,7 @@ def process_document(
         )
         if not chunks:
             raise InvalidDocumentError("Document produced no content chunks")
+        doc_type = next(s for s in config.SUPPORTED_SUFFIXES if source_key.endswith(s))
     except InvalidDocumentError as exc:
         manifest.put_status(
             tenant_id=tenant_id,
@@ -241,6 +243,7 @@ def process_document(
                     chunk=chunk,
                     tenant_id=tenant_id,
                     doc_id=doc_id,
+                    doc_type=doc_type,
                     source_bucket=bucket,
                     source_key=source_key,
                     source_version=source_version,

@@ -215,6 +215,17 @@ variable "max_upload_bytes" {
   default     = 1048576
 }
 
+variable "supported_suffixes" {
+  description = "File extensions accepted by the ingestion pipeline (e.g. [\".md\", \".txt\"]). Controls both the S3 event filter and the Lambda validation."
+  type        = list(string)
+  default     = [".md"]
+
+  validation {
+    condition     = length(var.supported_suffixes) > 0 && alltrue([for s in var.supported_suffixes : startswith(s, ".")])
+    error_message = "supported_suffixes must be a non-empty list of dot-prefixed extensions (e.g. \".md\")."
+  }
+}
+
 variable "raw_fetch_size" {
   description = "Number of raw vector candidates fetched before reranking"
   type        = number

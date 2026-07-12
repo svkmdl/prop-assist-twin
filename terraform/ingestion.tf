@@ -124,11 +124,14 @@ resource "aws_s3_bucket_notification" "rag_docs" {
   count  = local.rag_ingest_count
   bucket = aws_s3_bucket.rag_docs[0].id
 
-  queue {
-    queue_arn     = aws_sqs_queue.rag_ingest[0].arn
-    events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "incoming/"
-    filter_suffix = ".md"
+  dynamic "queue" {
+    for_each = var.supported_suffixes
+    content {
+      queue_arn     = aws_sqs_queue.rag_ingest[0].arn
+      events        = ["s3:ObjectCreated:*"]
+      filter_prefix = "incoming/"
+      filter_suffix = queue.value
+    }
   }
 
   depends_on = [aws_sqs_queue_policy.rag_ingest_from_s3]
@@ -286,6 +289,7 @@ resource "aws_lambda_function" "rag_ingest_worker" {
       MAX_UPLOAD_BYTES       = tostring(var.max_upload_bytes)
       INGESTION_MAX_WORKERS  = tostring(var.ingestion_max_workers)
       EMBEDDING_MAX_ATTEMPTS = tostring(var.embedding_max_attempts)
+      SUPPORTED_SUFFIXES     = join(",", var.supported_suffixes)
     }
   }
 }

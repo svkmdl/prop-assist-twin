@@ -15,7 +15,7 @@ from datetime import datetime
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from common import chunking, embeddings, vector_store
+from common import chunking, embeddings, vector_store, config
 from common.models import SourceItem
 from context import prompt, rewrite_prompt
 
@@ -105,7 +105,8 @@ SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 
 # Ingestion file configuration
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
-SAFE_MD_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+\.md$")
+_ext_alts = "|".join(re.escape(s.lstrip(".")) for s in sorted(config.SUPPORTED_SUFFIXES))
+SAFE_FILENAME_PATTERN = re.compile(rf"^[A-Za-z0-9._-]+\.(?:{_ext_alts})$")
 INGESTION_MAX_WORKERS = max(1, min(8, int(os.getenv("INGESTION_MAX_WORKERS", "4"))))
 
 # Set up logging
@@ -578,8 +579,9 @@ async def embed(request: EmbedRequest):
 
 async def ingest_file(file: UploadFile = File(...)):
     filename = Path(file.filename or "").name
-    if not SAFE_MD_FILENAME_PATTERN.fullmatch(filename):
-        raise HTTPException(status_code=400, detail="Only safe .md filenames are supported")
+    if not SAFE_FILENAME_PATTERN.fullmatch(filename):
+        allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
+        raise HTTPException(status_code=400, detail=f"Unsupported file type; allowed: {allowed}")
 
     try:
         content_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
@@ -600,7 +602,7 @@ async def ingest_file(file: UploadFile = File(...)):
                 metadata = {
                     "source_path": f"api_upload/{filename}",
                     "title": filename.rsplit('.', 1)[0],
-                    "doc_type": ".md",
+                    "doc_type": next(s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)),
                     "chunk_index": count
                 }
 
