@@ -243,6 +243,7 @@ export default function Twin() {
                     >
                         <option value="T001">T001</option>
                         <option value="T002">T002</option>
+                        <option value="admin">admin</option>
                     </select>
                     {isTenantLocked && (
                         <span className="text-xs text-slate-400 italic">Session active</span>
