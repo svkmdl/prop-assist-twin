@@ -6,6 +6,8 @@ their own boto3 ``s3vectors`` client.
 """
 from typing import Any, Dict, List, Optional
 
+_MAX_DELETE_KEYS_PER_CALL = 500  # S3 Vectors DeleteVectors 'keys' shape max
+
 
 def put_vector(
     *,
@@ -79,3 +81,29 @@ def query_vectors(
         kwargs["filter"] = metadata_filter
     response = client.query_vectors(**kwargs)
     return response.get("vectors", [])
+
+
+def delete_vectors(
+    *,
+    client: Any,
+    bucket: str,
+    index: str,
+    vector_ids: List[str],
+) -> List[str]:
+    """Delete vectors by key from an S3 Vectors index.
+
+    Args:
+        client: A boto3 ``s3vectors`` client (or compatible stub).
+        bucket: The vector bucket name.
+        index: The vector index name.
+        vector_ids: Deterministic keys to remove.
+
+    Returns:
+        The ``vector_ids`` that were submitted for deletion.
+    """
+    if not vector_ids:
+        return []
+    for start in range(0, len(vector_ids), _MAX_DELETE_KEYS_PER_CALL):
+        batch = vector_ids[start : start + _MAX_DELETE_KEYS_PER_CALL]
+        client.delete_vectors(vectorBucketName=bucket, indexName=index, keys=batch)
+    return vector_ids

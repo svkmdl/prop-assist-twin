@@ -139,6 +139,51 @@ def _index_chunk(
     )
 
 
+def process_deletion(
+    *, bucket: str, key: str, version_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Remove S3-Vectors chunks for a permanently-deleted S3 object version.
+
+    Returns a summary dict ``{"status", "tenant_id", "vectors_deleted"}``.
+
+    Raises:
+        InvalidDocumentError: for permanent failures (ack the message).
+        Exception: for transient failures (let SQS retry / route to the DLQ).
+    """
+    source_key = unquote_plus(key)
+    tenant_id, doc_id, _filename = parse_source_key(source_key)
+
+    if not version_id:
+        raise InvalidDocumentError(f"Delete event for {source_key} missing versionId")
+
+    source_sk = manifest.build_sort_key(source_key, version_id)
+    record = manifest.get_record(tenant_id, source_sk)
+    if not record or record.get("status") not in (manifest.SUCCEEDED, manifest.SKIPPED):
+        logger.info(
+            "No indexed vectors for %s@%s; nothing to delete", source_key, version_id
+        )
+        return {"status": "noop", "tenant_id": tenant_id, "vectors_deleted": 0}
+
+    chunk_count = record.get("chunk_count", 0)
+    vector_ids = [
+        f"{tenant_id}/{doc_id}/{version_id}/{i}" for i in range(chunk_count)
+    ]
+    vector_store.delete_vectors(
+        client=_s3vectors(),
+        bucket=config.VECTOR_BUCKET,
+        index=config.VECTOR_INDEX,
+        vector_ids=vector_ids,
+    )
+    manifest.mark_deleted(tenant_id=tenant_id, source_sk=source_sk)
+
+    logger.info("Deleted %d vectors for %s@%s", len(vector_ids), source_key, version_id)
+    return {
+        "status": "deleted",
+        "tenant_id": tenant_id,
+        "vectors_deleted": len(vector_ids),
+    }
+
+
 def process_document(
     *, bucket: str, key: str, version_id: Optional[str] = None
 ) -> Dict[str, Any]:

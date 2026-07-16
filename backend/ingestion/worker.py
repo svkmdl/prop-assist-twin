@@ -25,6 +25,7 @@ def _process_s3_event(payload: dict) -> None:
         return
 
     for s3_record in s3_records:
+        event_name = s3_record.get("eventName", "")
         s3_info = s3_record.get("s3", {})
         bucket = s3_info.get("bucket", {}).get("name")
         obj = s3_info.get("object", {})
@@ -34,9 +35,14 @@ def _process_s3_event(payload: dict) -> None:
         if not bucket or not key:
             raise InvalidDocumentError("S3 event missing bucket or object key")
 
-        ingest_document.process_document(
-            bucket=bucket, key=key, version_id=version_id
-        )
+        if event_name.startswith("ObjectRemoved:"):
+            ingest_document.process_deletion(
+                bucket=bucket, key=key, version_id=version_id
+            )
+        else:
+            ingest_document.process_document(
+                bucket=bucket, key=key, version_id=version_id
+            )
 
 
 def _process_record(record: dict) -> None:

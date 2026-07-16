@@ -127,8 +127,20 @@ resource "aws_s3_bucket_notification" "rag_docs" {
   dynamic "queue" {
     for_each = var.supported_suffixes
     content {
+      id            = "created-${queue.value}"
       queue_arn     = aws_sqs_queue.rag_ingest[0].arn
       events        = ["s3:ObjectCreated:*"]
+      filter_prefix = "incoming/"
+      filter_suffix = queue.value
+    }
+  }
+
+  dynamic "queue" {
+    for_each = var.supported_suffixes
+    content {
+      id            = "removed-${queue.value}"
+      queue_arn     = aws_sqs_queue.rag_ingest[0].arn
+      events        = ["s3:ObjectRemoved:Delete"]
       filter_prefix = "incoming/"
       filter_suffix = queue.value
     }

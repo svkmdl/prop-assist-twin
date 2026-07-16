@@ -19,6 +19,7 @@ RUNNING = "RUNNING"
 SUCCEEDED = "SUCCEEDED"
 FAILED = "FAILED"
 SKIPPED = "SKIPPED"
+DELETED = "DELETED"
 
 _dynamodb_client = None
 
@@ -94,6 +95,26 @@ def put_status(
         item["chunk_count"] = chunk_count
 
     _client().put_item(TableName=config.MANIFEST_TABLE, Item=_serialize(item))
+
+
+def mark_deleted(*, tenant_id: str, source_sk: str) -> None:
+    """Flip an existing manifest record to ``DELETED``, preserving its history."""
+    existing = get_record(tenant_id, source_sk)
+    if not existing:
+        return
+    put_status(
+        tenant_id=tenant_id,
+        source_sk=source_sk,
+        status=DELETED,
+        source_bucket=existing.get("source_bucket", ""),
+        source_key=existing.get("source_key", ""),
+        source_version=existing.get("source_version", ""),
+        sha256=existing.get("sha256", ""),
+        vector_bucket=existing.get("vector_bucket", ""),
+        vector_index=existing.get("vector_index", ""),
+        embedding_model=existing.get("embedding_model", ""),
+        chunk_count=existing.get("chunk_count"),
+    )
 
 
 def _serialize(item: Dict[str, Any]) -> Dict[str, Any]:

@@ -85,15 +85,22 @@ class FakeSageMaker:
 
 
 class FakeS3Vectors:
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, fail_delete=False):
         self.fail_on = fail_on
+        self.fail_delete = fail_delete
         self.puts = []
+        self.deletes = []
 
     def put_vectors(self, **kwargs):
         vector_id = kwargs["vectors"][0]["key"]
         if self.fail_on is not None and vector_id == self.fail_on:
             raise RuntimeError("vector write failed")
         self.puts.append(kwargs)
+
+    def delete_vectors(self, **kwargs):
+        if self.fail_delete:
+            raise RuntimeError("vector delete failed")
+        self.deletes.append(kwargs)
 
 
 def _load_ingestion(monkeypatch, env_overrides=None):
@@ -152,17 +159,16 @@ def ingestion(monkeypatch):
     return _factory
 
 
-def make_event(bucket, key, version_id="v1", message_id="m1"):
-    s3_body = {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {"name": bucket},
-                    "object": {"key": key, "versionId": version_id},
-                }
-            }
-        ]
+def make_event(bucket, key, version_id="v1", message_id="m1", event_name=None):
+    s3_record = {
+        "s3": {
+            "bucket": {"name": bucket},
+            "object": {"key": key, "versionId": version_id},
+        }
     }
+    if event_name is not None:
+        s3_record["eventName"] = event_name
+    s3_body = {"Records": [s3_record]}
     return {"Records": [{"messageId": message_id, "body": json.dumps(s3_body)}]}
 
 
@@ -233,6 +239,98 @@ class TestIdempotency:
         assert len(mods.vectors.puts) == puts_after_first
         record = mods.manifest.get_record("tenant-a", "incoming/tenant-a/doc.md#v1")
         assert record["status"] == "SKIPPED"
+
+
+class TestDeletion:
+    def test_delete_event_removes_vectors_for_indexed_document(self, ingestion):
+        content = "# Title\n\nbody text"
+        mods = ingestion(
+            objects={"incoming/tenant-a/doc.md": (content.encode("utf-8"), "v1")}
+        )
+        create_event = make_event("rag-docs", "incoming/tenant-a/doc.md")
+        mods.worker.handler(create_event, None)
+        chunk_count = len(mods.vectors.puts)
+
+        delete_event = make_event(
+            "rag-docs",
+            "incoming/tenant-a/doc.md",
+            message_id="del1",
+            event_name="ObjectRemoved:Delete",
+        )
+        result = mods.worker.handler(delete_event, None)
+
+        assert result == {"batchItemFailures": []}
+        assert len(mods.vectors.deletes) == 1
+        deleted_keys = set(mods.vectors.deletes[0]["keys"])
+        assert deleted_keys == {
+            f"tenant-a/doc/v1/{i}" for i in range(chunk_count)
+        }
+
+        record = mods.manifest.get_record("tenant-a", "incoming/tenant-a/doc.md#v1")
+        assert record["status"] == "DELETED"
+
+    def test_delete_event_with_no_manifest_record_is_a_noop(self, ingestion):
+        mods = ingestion()
+        delete_event = make_event(
+            "rag-docs",
+            "incoming/tenant-a/never-ingested.md",
+            event_name="ObjectRemoved:Delete",
+        )
+        result = mods.worker.handler(delete_event, None)
+
+        assert result == {"batchItemFailures": []}
+        assert mods.vectors.deletes == []
+
+    def test_duplicate_delete_event_is_idempotent(self, ingestion):
+        mods = ingestion(
+            objects={"incoming/tenant-a/doc.md": (b"# Title\n\nbody", "v1")}
+        )
+        mods.worker.handler(make_event("rag-docs", "incoming/tenant-a/doc.md"), None)
+
+        delete_event = make_event(
+            "rag-docs",
+            "incoming/tenant-a/doc.md",
+            message_id="del1",
+            event_name="ObjectRemoved:Delete",
+        )
+        mods.worker.handler(delete_event, None)
+        deletes_after_first = len(mods.vectors.deletes)
+
+        second = mods.worker.handler(delete_event, None)
+
+        assert second == {"batchItemFailures": []}
+        assert len(mods.vectors.deletes) == deletes_after_first
+
+    def test_delete_vector_failure_reports_batch_item_failure(self, ingestion):
+        mods = ingestion(
+            objects={"incoming/tenant-a/doc.md": (b"# Title\n\nbody", "v1")},
+        )
+        mods.worker.handler(make_event("rag-docs", "incoming/tenant-a/doc.md"), None)
+        mods.ingest_document._s3vectors_client.fail_delete = True
+
+        delete_event = make_event(
+            "rag-docs",
+            "incoming/tenant-a/doc.md",
+            message_id="xyz",
+            event_name="ObjectRemoved:Delete",
+        )
+        result = mods.worker.handler(delete_event, None)
+
+        assert result == {"batchItemFailures": [{"itemIdentifier": "xyz"}]}
+        record = mods.manifest.get_record("tenant-a", "incoming/tenant-a/doc.md#v1")
+        assert record["status"] == "SUCCEEDED"
+
+    def test_create_event_still_routes_to_indexing(self, ingestion):
+        mods = ingestion(
+            objects={"incoming/tenant-a/doc.md": (b"# Title\n\nbody", "v1")}
+        )
+        event = make_event(
+            "rag-docs", "incoming/tenant-a/doc.md", event_name="ObjectCreated:Put"
+        )
+        result = mods.worker.handler(event, None)
+
+        assert result == {"batchItemFailures": []}
+        assert len(mods.vectors.puts) >= 1
 
 
 class TestValidationFailures:
