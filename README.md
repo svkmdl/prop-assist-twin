@@ -39,7 +39,7 @@ The frontend is statically exported by Next.js and served from S3 behind CloudFr
   * Amazon SageMaker can optionally host a serverless embedding endpoint used by `/embed`, RAG retrieval, and the ingestion worker.
   * S3 (memory bucket) stores conversation history in deployed environments.
   * S3 Vectors can optionally store indexed markdown chunks for RAG-backed `/chat` answers.
-  * S3 (RAG source bucket) receives raw markdown uploads under `incoming/{tenant_id}/` and emits `ObjectCreated` events.
+  * S3 (RAG source bucket) receives raw markdown uploads under `incoming/`; the tenant id is derived from the markdown file's direct parent folder (for example, `incoming/Tenants/T001/file.md` -> `T001`) and emits `ObjectCreated` events.
   * SQS queue + dead-letter queue buffer ingestion events and isolate failures.
   * A second Lambda (ingestion worker) consumes the queue, validates, chunks, embeds, and indexes documents.
   * DynamoDB stores the ingestion manifest for idempotency and status tracking.
@@ -73,7 +73,7 @@ flowchart TD
   RESP --> UI[Render answer and source snippets]
 
   subgraph Ingestion[Knowledge ingestion event-driven pipeline]
-    MD[Admin uploads markdown to S3 incoming/tenant_id/] --> EVT[S3 ObjectCreated event]
+    MD[Admin uploads markdown to S3 incoming/.../tenant_id/file.md] --> EVT[S3 ObjectCreated event]
     EVT --> SQS[SQS ingest queue]
     SQS --> WORK[Ingestion worker Lambda]
     WORK --> SAFE[Validate extension, size, UTF-8, and checksum]
@@ -163,7 +163,7 @@ In deployed environments, document ingestion is fully decoupled from the chat La
 
 ### Flow
 
-1. An admin uploads a markdown file to the RAG source bucket under `incoming/{tenant_id}/{document}.md`.
+1. An admin uploads a markdown file to the RAG source bucket under `incoming/`, with the tenant id as the markdown file's direct parent folder (for example, `incoming/Tenants/T001/{document}.md` or `incoming/T001/{document}.md`).
 2. The S3 `ObjectCreated` event (filtered to the `incoming/` prefix and `.md` suffix) is delivered to an SQS queue.
 3. The ingestion worker Lambda consumes the queue (batch size 1, partial-batch failure reporting enabled) and for each document:
    - reads the object from S3 and validates extension, size, and UTF-8 content,
@@ -571,15 +571,15 @@ Required GitHub secrets:
 
 ## RAG knowledge ingestion
 
-The repository includes seed markdown knowledge under `backend/data/kb`. In a deployed environment, ingest it by uploading the files to the RAG source bucket under `incoming/{tenant_id}/`. Each upload triggers the event-driven pipeline, and you can track progress in the DynamoDB manifest table.
+The repository includes seed markdown knowledge under `backend/data/kb`. In a deployed environment, ingest it by uploading the files to the RAG source bucket under `incoming/`, with the tenant id as the direct parent folder of each markdown file. For example, both `incoming/T001/company_faq.md` and `incoming/Tenants/T001/company_faq.md` store vectors with `tenant_id = T001`. Each upload triggers the event-driven pipeline, and you can track progress in the DynamoDB manifest table.
 
 ```bash
 RAG_DOCS_BUCKET=$(terraform -chdir=terraform output -raw rag_docs_bucket)
-TENANT_ID=tenant-a
+TENANT_ID=T001
 
 cd backend
 for file in data/kb/*.md; do
-  aws s3 cp "$file" "s3://${RAG_DOCS_BUCKET}/incoming/${TENANT_ID}/$(basename "$file")"
+  aws s3 cp "$file" "s3://${RAG_DOCS_BUCKET}/incoming/Tenants/${TENANT_ID}/$(basename "$file")"
 done
 ```
 

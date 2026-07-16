@@ -62,7 +62,11 @@ def _s3vectors():
 
 
 def parse_source_key(source_key: str) -> Tuple[str, str, str]:
-    """Extract ``(tenant_id, doc_id, filename)`` from ``incoming/{tenant}/{doc}.md``.
+    """Extract ``(tenant_id, doc_id, filename)`` from an ``incoming/`` key.
+
+    The tenant is the direct parent folder of the markdown file.  This supports
+    both ``incoming/{tenant}/{doc}.md`` and deeper layouts such as
+    ``incoming/Tenants/{tenant}/{doc}.md``.
 
     Raises:
         InvalidDocumentError: if the key does not match the expected layout.
@@ -71,7 +75,7 @@ def parse_source_key(source_key: str) -> Tuple[str, str, str]:
     if len(parts) < 3 or parts[0] != "incoming":
         raise InvalidDocumentError(f"Unexpected source key layout: {source_key}")
 
-    tenant_id = parts[1]
+    tenant_id = parts[-2]
     filename = parts[-1]
     if not tenant_id or not filename:
         raise InvalidDocumentError(f"Unexpected source key layout: {source_key}")

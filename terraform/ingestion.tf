@@ -1,6 +1,6 @@
 # Event-driven RAG ingestion pipeline
 #
-#   S3 (incoming/{tenant}/*.md) -> SQS -> Lambda worker -> S3 Vectors
+#   S3 (incoming/.../{tenant}/*.md) -> SQS -> Lambda worker -> S3 Vectors
 #                                          |-> DynamoDB ingestion manifest
 #   Failures: SQS DLQ + CloudWatch alarms
 #

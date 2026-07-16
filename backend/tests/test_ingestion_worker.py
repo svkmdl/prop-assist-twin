@@ -220,6 +220,20 @@ class TestHappyPath:
             "tenant-a", "incoming/tenant-a/my doc.md#v1"
         )["status"] == "SUCCEEDED"
 
+    def test_tenant_id_comes_from_parent_folder(self, ingestion):
+        """Nested source layouts use the file's parent folder as tenant_id."""
+        key = "incoming/Tenants/T001/T001.md"
+        mods = ingestion(objects={key: (b"# Tenant T001\n\nbody", "v1")})
+
+        result = mods.worker.handler(make_event("rag-docs", key), None)
+
+        assert result == {"batchItemFailures": []}
+        vector = mods.vectors.puts[0]["vectors"][0]
+        assert vector["key"] == "T001/T001/v1/0"
+        assert vector["metadata"]["tenant_id"] == "T001"
+        assert vector["metadata"]["source_key"] == key
+        assert mods.manifest.get_record("T001", f"{key}#v1")["status"] == "SUCCEEDED"
+
 
 class TestIdempotency:
     def test_duplicate_upload_is_skipped(self, ingestion):
