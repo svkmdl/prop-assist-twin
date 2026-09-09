@@ -585,6 +585,34 @@ done
 
 Only markdown files uploaded under `incoming/` with a `.md` suffix trigger ingestion. The worker validates file size and UTF-8 content, deduplicates by version/checksum, and records status in the manifest. For quick local testing you can instead use the synchronous `POST /ingest` route with `LOCAL_DEV=true`.
 
+### K2 corpus (admin tenant PoC dataset)
+
+For a larger RAG PoC dataset, the `admin` tenant can be seeded from the [K2 corpus](https://zenodo.org/records/7425489), a public collection of 2,110 German-language documents (contracts, policies, reports) released as two packages:
+
+- `XML/` — one XML file per document (`d{id}.xml`), already OCR'd and split into `<page>` → `<heading>`/`<sentence>` elements. Each element carries a `frequent` attribute (`yes`/`no`) flagging whether that exact text repeats often (templated headings, running boilerplate) versus is unique to that spot in the document.
+- `K2_PDFs/` — the matching source PDFs (one per XML document, linked via the XML's `fname` attribute). Not used here — the XML already has clean extracted text, so no PDF parsing is needed.
+
+This dataset is not part of the repository. Download and unpack both Zenodo packages under the gitignored `temp/` directory as `temp/XML/` and `temp/K2_PDFs/`, then use `temp/build_corpus_markdown.py` (stdlib + boto3 only) to convert and upload:
+
+```bash
+# Convert only, no upload: writes temp/md_output/*.md for review.
+# Headings/sentences with frequent='yes' are dropped as boilerplate (falling
+# back to the unfiltered text if that would leave a document empty).
+python3 temp/build_corpus_markdown.py --dry-run
+
+# Upload the next batch of 10 not-yet-uploaded documents to
+# incoming/Tenants/admin/, tracking progress in temp/upload_state.json so
+# re-running the same command continues with the next batch. Requires boto3
+# (e.g. run with backend/.venv/bin/python3) and an AWS session that can write
+# to the RAG source bucket.
+python3 temp/build_corpus_markdown.py --bucket "$RAG_DOCS_BUCKET"
+
+# Once satisfied with a few batches, upload everything remaining in one run.
+python3 temp/build_corpus_markdown.py --bucket "$RAG_DOCS_BUCKET" --all
+```
+
+Batching by default (rather than uploading all 2,110 at once) keeps the burst of S3 events, and the resulting ingestion worker/SageMaker invocations, within the serverless embedding endpoint's small configured concurrency (`sagemaker_embedding_max_concurrency`).
+
 * * *
 
 ## API endpoints
