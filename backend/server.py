@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 import os
@@ -102,6 +102,7 @@ LOCAL_DEV = os.getenv("LOCAL_DEV", "false").lower() == "true"
 # Request Configuration
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "3000"))
 SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+TENANT_ID_PATTERN = r"^[A-Za-z0-9_-]{1,32}$"
 
 # Ingestion file configuration
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
@@ -127,7 +128,7 @@ class ChatRequest(BaseModel):
     )
     tenant_id: str = Field(
         default=config.DEFAULT_TENANT_ID,
-        pattern=r"^[A-Za-z0-9_-]{1,32}$",
+        pattern=TENANT_ID_PATTERN,
     )
 
     @field_validator("tenant_id")
@@ -303,13 +304,18 @@ def _document_group_key(metadata: Dict) -> str:
     same-named documents from different folders/tenants. ``source_key`` is used
     for grouping only and is never returned to clients or put in the prompt,
     because it exposes the internal bucket layout and tenant folder names.
+
+    The tenant is part of the key so that same-named ``/ingest`` uploads for
+    different tenants stay distinct under unfiltered (admin) retrieval.
     """
-    return (
+    path = (
         metadata.get("source_path")
         or metadata.get("source_key")
         or metadata.get("title")
         or "unknown"
     )
+    tenant_id = metadata.get("tenant_id")
+    return f"{tenant_id}:{path}" if tenant_id else path
 
 
 def index_text_chunk(
@@ -635,7 +641,18 @@ async def health_check():
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
-async def ingest_file(file: UploadFile = File(...)):
+async def ingest_file(
+    file: UploadFile = File(...),
+    tenant_id: str = Form(..., pattern=TENANT_ID_PATTERN),
+):
+    # Without tenant_id metadata a vector is unreachable for tenant-filtered
+    # retrieval, so the tenant is required and checked against the allowlist.
+    if tenant_id not in config.ALLOWED_TENANT_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}",
+        )
+
     filename = Path(file.filename or "").name
     if not SAFE_FILENAME_PATTERN.fullmatch(filename):
         allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
@@ -655,9 +672,12 @@ async def ingest_file(file: UploadFile = File(...)):
         with ThreadPoolExecutor(max_workers=INGESTION_MAX_WORKERS) as executor:
             for count, chunk in enumerate(chunk_text(content)):
 
-                vector_id = f"{filename}_{count}"
+                # Tenant-prefixed so the same filename uploaded for two tenants
+                # does not overwrite the other tenant's vectors.
+                vector_id = f"{tenant_id}/{filename}_{count}"
 
                 metadata = {
+                    "tenant_id": tenant_id,
                     "source_path": f"api_upload/{filename}",
                     "title": filename.rsplit('.', 1)[0],
                     "doc_type": next(s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)),

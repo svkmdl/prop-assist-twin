@@ -155,3 +155,34 @@ def test_worker_sources_with_same_filename_in_different_tenants_are_distinct(
     for leaked in ("incoming/", "Tenants/"):
         assert leaked not in payload
         assert leaked not in prompt_block
+
+
+def test_ingest_api_sources_with_same_path_in_different_tenants_are_distinct(
+    server_module, monkeypatch
+):
+    """/ingest vectors share ``source_path=api_upload/<file>`` across tenants;
+    the tenant must be part of the diversity grouping key."""
+    raw_hits = [
+        {
+            "key": f"{tenant}/faq.md_{i}",
+            "distance": 0.1 + 0.01 * n,
+            "metadata": {
+                "tenant_id": tenant,
+                "title": "faq",
+                "source_path": "api_upload/faq.md",
+                "chunk_text": f"faq answer {tenant} {i}",
+            },
+        }
+        for n, (tenant, i) in enumerate(
+            [("T001", 0), ("T001", 1), ("T002", 0), ("T002", 1)]
+        )
+    ]
+    monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
+    monkeypatch.setattr(
+        server_module, "search_text_chunks", lambda query, top_k, metadata_filter=None: raw_hits
+    )
+    monkeypatch.setattr(server_module, "MAX_CHUNKS_PER_DOC", 1)
+
+    sources = server_module.retrieve_sources("faq answer", fetch_n=5, return_n=3)
+
+    assert sorted(s.id for s in sources) == ["T001/faq.md_0", "T002/faq.md_0"]

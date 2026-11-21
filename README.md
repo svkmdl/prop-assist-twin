@@ -350,6 +350,7 @@ curl -X POST http://localhost:8000/embed \
 
 curl -X POST http://localhost:8000/ingest \
   -H "x-api-key: $ADMIN_API_KEY" \
+  -F "tenant_id=T001" \
   -F "file=@data/kb/company_faq.md"
 ```
 
@@ -669,7 +670,7 @@ Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `
 
 ### `POST /ingest` admin (local only)
 
-Accepts a markdown upload, applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata to S3 Vectors. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
+Accepts a markdown upload plus a required `tenant_id` form field (one of the allowed tenants, e.g. `T001`), applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata (including `tenant_id`, so tenant-filtered chat retrieval can find them) to S3 Vectors under `{tenant_id}/{filename}_{chunk}` IDs. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
 
 ### `GET /conversation/{session_id}` admin
 
