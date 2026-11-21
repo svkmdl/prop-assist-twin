@@ -8,6 +8,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from common import chunking, config, embeddings, vector_store
 from ingestion import manifest
@@ -168,9 +169,28 @@ def process_deletion(
         )
         return {"status": "noop", "tenant_id": tenant_id, "vectors_deleted": 0}
 
-    chunk_count = record.get("chunk_count", 0)
+    deleted = _delete_version_vectors(
+        tenant_id=tenant_id,
+        doc_id=doc_id,
+        source_version=version_id,
+        chunk_count=record.get("chunk_count", 0),
+    )
+    manifest.mark_deleted(tenant_id=tenant_id, source_sk=source_sk)
+
+    logger.info("Deleted %d vectors for %s@%s", deleted, source_key, version_id)
+    return {
+        "status": "deleted",
+        "tenant_id": tenant_id,
+        "vectors_deleted": deleted,
+    }
+
+
+def _delete_version_vectors(
+    *, tenant_id: str, doc_id: str, source_version: str, chunk_count: int
+) -> int:
+    """Delete the deterministic vector ids of one indexed document version."""
     vector_ids = [
-        f"{tenant_id}/{doc_id}/{version_id}/{i}" for i in range(chunk_count)
+        f"{tenant_id}/{doc_id}/{source_version}/{i}" for i in range(chunk_count)
     ]
     vector_store.delete_vectors(
         client=_s3vectors(),
@@ -178,14 +198,68 @@ def process_deletion(
         index=config.VECTOR_INDEX,
         vector_ids=vector_ids,
     )
-    manifest.mark_deleted(tenant_id=tenant_id, source_sk=source_sk)
+    return len(vector_ids)
 
-    logger.info("Deleted %d vectors for %s@%s", len(vector_ids), source_key, version_id)
-    return {
-        "status": "deleted",
-        "tenant_id": tenant_id,
-        "vectors_deleted": len(vector_ids),
-    }
+
+def _current_s3_version(bucket: str, source_key: str) -> Optional[str]:
+    """Return the key's current S3 VersionId, or ``None`` if it cannot be known.
+
+    ``None`` means: object gone (404 / delete marker) or bucket unversioned.
+    Other errors propagate so SQS retries.
+    """
+    try:
+        head = _s3().head_object(Bucket=bucket, Key=source_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    version = head.get("VersionId")
+    return version if version and version != "null" else None
+
+
+def _supersede_stale_versions(
+    *, bucket: str, source_key: str, tenant_id: str, doc_id: str
+) -> int:
+    """Remove vectors of every indexed version that is not S3's current version.
+
+    S3 overwrites create a new version with new vector ids; without this the
+    old version's chunks stay searchable and compete with the new content.
+    Comparing against S3's *current* version (rather than "the version just
+    processed") keeps this correct when SQS delivers versions out of order: a
+    stale version that finishes last removes its own vectors.
+    """
+    current = _current_s3_version(bucket, source_key)
+    if current is None:
+        logger.info(
+            "Current version of %s unknown; skipping stale-version cleanup", source_key
+        )
+        return 0
+
+    superseded = 0
+    for record in manifest.list_versions(tenant_id, source_key):
+        version = record.get("source_version", "")
+        if version == current or record.get("status") not in (
+            manifest.SUCCEEDED,
+            manifest.SKIPPED,
+        ):
+            continue
+        deleted = _delete_version_vectors(
+            tenant_id=tenant_id,
+            doc_id=doc_id,
+            source_version=version,
+            chunk_count=record.get("chunk_count", 0),
+        )
+        manifest.mark_status(
+            tenant_id=tenant_id,
+            source_sk=record["source_sk"],
+            status=manifest.SUPERSEDED,
+        )
+        superseded += 1
+        logger.info(
+            "Superseded %s@%s (%d vectors removed)", source_key, version, deleted
+        )
+    return superseded
 
 
 def process_document(
@@ -260,10 +334,20 @@ def process_document(
             embedding_model=config.EMBEDDING_MODEL,
             chunk_count=existing.get("chunk_count", len(chunks)),
         )
+        # Re-run cleanup on redelivery so a cleanup failure on the first
+        # delivery (which raised and triggered the retry) is eventually healed.
+        superseded = (
+            _supersede_stale_versions(
+                bucket=bucket, source_key=source_key, tenant_id=tenant_id, doc_id=doc_id
+            )
+            if resolved_version
+            else 0
+        )
         return {
             "status": manifest.SKIPPED,
             "tenant_id": tenant_id,
             "chunk_count": existing.get("chunk_count", len(chunks)),
+            "versions_superseded": superseded,
         }
 
     manifest.put_status(
@@ -334,8 +418,19 @@ def process_document(
         chunk_count=len(chunks),
     )
     logger.info("Ingested %s (%d chunks)", source_key, len(chunks))
+
+    # Only meaningful with S3 versioning: without a VersionId the content hash
+    # is the version and there is no notion of which one is current.
+    superseded = (
+        _supersede_stale_versions(
+            bucket=bucket, source_key=source_key, tenant_id=tenant_id, doc_id=doc_id
+        )
+        if resolved_version
+        else 0
+    )
     return {
         "status": manifest.SUCCEEDED,
         "tenant_id": tenant_id,
         "chunk_count": len(chunks),
+        "versions_superseded": superseded,
     }

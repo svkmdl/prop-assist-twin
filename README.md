@@ -169,14 +169,16 @@ In deployed environments, document ingestion is fully decoupled from the chat La
    - reads the object from S3 and validates extension, size, and UTF-8 content,
    - computes a SHA-256 checksum and checks the DynamoDB manifest for idempotency,
    - chunks the content, embeds each chunk via the SageMaker endpoint, and writes vectors to S3 Vectors with deterministic IDs,
-   - updates the manifest status and chunk count.
+   - updates the manifest status and chunk count;
+   - removes vectors of every other indexed version of the same key that is not S3's current version (manifest `SUPERSEDED`), so overwritten documents do not leave stale chunks searchable.
 
 ### Failure handling
 
 | Scenario | Behavior |
 | --- | --- |
 | Invalid file (bad extension, non-UTF-8, empty, too large) | Manifest marked `FAILED`; message acknowledged (no retry) |
-| Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing |
+| Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing (stale-version cleanup is re-attempted) |
+| Overwrite (new S3 version of an indexed key) | New version indexed, then older versions' vectors deleted and marked `SUPERSEDED`. The current version is read via `HeadObject`, so out-of-order SQS delivery cannot let an old version win. Skipped if the bucket is unversioned or the object no longer exists |
 | Embedding or vector-write failure | Message retried via SQS; after `max_receive_count`, routed to the DLQ |
 | Throttling from the serverless embedding endpoint | Absorbed by adaptive botocore retries (`EMBEDDING_MAX_ATTEMPTS`) |
 
@@ -186,7 +188,7 @@ Vectors use deterministic IDs of the form `{tenant_id}/{doc_id}/{source_version_
 
 ### DynamoDB manifest
 
-The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `SKIPPED`.
+The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, and `SUPERSEDED`.
 
 ### Observability
 

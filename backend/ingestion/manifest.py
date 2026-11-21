@@ -7,7 +7,7 @@ operational visibility. Table schema:
     SK (source_sk):  S   ->  "{source_key}#{source_version_or_sha256}"
 """
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import boto3
 
@@ -20,6 +20,8 @@ SUCCEEDED = "SUCCEEDED"
 FAILED = "FAILED"
 SKIPPED = "SKIPPED"
 DELETED = "DELETED"
+# Vectors removed because a newer S3 version of the same key was indexed.
+SUPERSEDED = "SUPERSEDED"
 
 _dynamodb_client = None
 
@@ -54,6 +56,30 @@ def get_record(tenant_id: str, source_sk: str) -> Optional[Dict[str, Any]]:
     if not item:
         return None
     return _deserialize(item)
+
+
+def list_versions(tenant_id: str, source_key: str) -> List[Dict[str, Any]]:
+    """Return all manifest records (every version) for one source key."""
+    prefix = f"{source_key}#"
+    records: List[Dict[str, Any]] = []
+    kwargs: Dict[str, Any] = {
+        "TableName": config.MANIFEST_TABLE,
+        "KeyConditionExpression": "tenant_id = :t AND begins_with(source_sk, :p)",
+        "ExpressionAttributeValues": {":t": {"S": tenant_id}, ":p": {"S": prefix}},
+        "ConsistentRead": True,
+    }
+    while True:
+        response = _client().query(**kwargs)
+        for item in response.get("Items", []):
+            record = _deserialize(item)
+            # begins_with is a prefix match: a key like "faq.md#x.md" would also
+            # match "faq.md#", so require the exact source_key.
+            if record.get("source_key") == source_key:
+                records.append(record)
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return records
+        kwargs["ExclusiveStartKey"] = last_key
 
 
 def put_status(
@@ -99,13 +125,18 @@ def put_status(
 
 def mark_deleted(*, tenant_id: str, source_sk: str) -> None:
     """Flip an existing manifest record to ``DELETED``, preserving its history."""
+    mark_status(tenant_id=tenant_id, source_sk=source_sk, status=DELETED)
+
+
+def mark_status(*, tenant_id: str, source_sk: str, status: str) -> None:
+    """Change the status of an existing manifest record, preserving its fields."""
     existing = get_record(tenant_id, source_sk)
     if not existing:
         return
     put_status(
         tenant_id=tenant_id,
         source_sk=source_sk,
-        status=DELETED,
+        status=status,
         source_bucket=existing.get("source_bucket", ""),
         source_key=existing.get("source_key", ""),
         source_version=existing.get("source_version", ""),
