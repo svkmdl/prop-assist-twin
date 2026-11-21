@@ -115,10 +115,10 @@ frontend/components/twin.tsx
 4. Fetch `RAW_FETCH_SIZE` candidate vectors (default **12**); optionally reject vectors whose distance exceeds `MAX_RETRIEVAL_DISTANCE` (code default unset; Terraform default **0.5**).
 5. Rerank candidates via `(1.0 - distance) + (0.5 * lexical_score)`. The lexical score is a **custom single-document BM25-inspired approximation**, NOT corpus-based BM25, even though `rank-bm25` is a declared dependency.
 6. Keep at most `MAX_CHUNKS_PER_DOC` (**2**) chunks per document, then return up to `FINAL_TOP_K` (**3**) source items.
-7. Document grouping (`_document_group_key`) uses `source_path`, else `source_key`, else `title`, else `unknown`. `source_key` is used for grouping only and is never exposed in responses or the prompt. `shorten_snippet` normalizes whitespace; response snippets default to **280** chars and model context to **1,500** chars per source.
+7. Document grouping (`_document_group_key`) uses `source_path`, else `source_key`, else `title`, else `unknown`, prefixed with `tenant_id` when present (so same-named docs of different tenants stay distinct under admin retrieval). `source_key` is used for grouping only and is never exposed in responses or the prompt. `shorten_snippet` normalizes whitespace; response snippets default to **280** chars and model context to **1,500** chars per source.
 8. `build_retrieval_block()` numbers final sources `[S1]`, `[S2]`, etc. `SourceItem.context` is internal (`exclude=True`) and must not appear in public JSON.
 
-**Metadata compatibility:** the ingestion worker writes `source_key` but not `source_path`, whereas `/ingest` writes `source_path` and no `tenant_id`. Thus worker-indexed sources have a null `source_path` in chat responses (deliberately: the raw S3 key reveals bucket layout and tenant folders), but grouping still distinguishes them via `source_key`. Both paths currently set `doc_type` from the filename suffix (usually `.md`), while the `README.md` example shows `"markdown"`; follow code, not the illustrative example, when updating tests or clients. Consider compatibility and a backfill/migration before changing metadata keys.
+**Metadata compatibility:** the ingestion worker writes `source_key` but not `source_path`, whereas `/ingest` writes `source_path` and `tenant_id` (no `source_key`). Thus worker-indexed sources have a null `source_path` in chat responses (deliberately: the raw S3 key reveals bucket layout and tenant folders), but grouping still distinguishes them via `source_key`. Both paths currently set `doc_type` from the filename suffix (usually `.md`), while the `README.md` example shows `"markdown"`; follow code, not the illustrative example, when updating tests or clients. Consider compatibility and a backfill/migration before changing metadata keys.
 
 ### 3.3 Document ingestion (production path)
 
@@ -145,18 +145,18 @@ S3 versioned rag-docs bucket: incoming/.../{tenant}/{document}.md
 - Default supported extension is `.md` (configured via `SUPPORTED_SUFFIXES`); documents must be nonempty UTF-8 and at most `MAX_UPLOAD_BYTES` (**1,048,576** bytes). Defaults: `CHUNK_SIZE=1500`, `CHUNK_OVERLAP=200`.
 - Use S3 `VersionId`, if supplied or returned by the object, else content SHA-256 as `source_version`. Manifest sort key: `source_key#source_version`; partition key: `tenant_id`.
 - Chunk vector ID: `{tenant_id}/{doc_id}/{source_version}/{chunk_index}`. Metadata includes `tenant_id`, `source_bucket`, `source_key`, `source_version`, `title`, `doc_type`, `chunk_index`, `chunk_text`, `embedding_model`, `ingested_at`.
-- `manifest.py` defines `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`; the active ingest code writes `RUNNING`/`SUCCEEDED`/`FAILED`/`SKIPPED`, and deletion writes `DELETED`.
+- `manifest.py` defines `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, `SUPERSEDED`; the active ingest code writes `RUNNING`/`SUCCEEDED`/`FAILED`/`SKIPPED`/`SUPERSEDED`, and deletion writes `DELETED`.
 - `SUCCEEDED` + same SHA-256 is considered a duplicate and marked `SKIPPED`; other cases get (re)indexed. Vector writes may run in a thread pool with `INGESTION_MAX_WORKERS` limited to **1..8** (default **4**).
 - **Permanent** invalid documents (`InvalidDocumentError`) are logged/acknowledged and are not sent to the DLQ; when a manifest key can be established, validation failures mark it `FAILED`. **Transient** unexpected errors return an SQS `batchItemFailures` entry for retry. Do not replace this distinction with blanket exception swallowing.
 - Deletion requires a matching *versioned* manifest record, uses `common.vector_store.delete_vectors()` (batches of at most **500** IDs), then marks history `DELETED`.
 
-**Be careful with S3 versioning:** validate how real `ObjectRemoved:Delete`/`DeleteMarkerCreated` events carry version IDs before changing deletion behavior. The currently configured notification only subscribes to `s3:ObjectRemoved:Delete`, while deletion logic expects an indexed object's matching version. Overwrites also create new vector versions without removing older ones. Treat this as an operational edge case to investigate and test, not as already-solved cleanup.
+**Be careful with S3 versioning:** validate how real `ObjectRemoved:Delete`/`DeleteMarkerCreated` events carry version IDs before changing deletion behavior. The currently configured notification only subscribes to `s3:ObjectRemoved:Delete`, while deletion logic expects an indexed object's matching version. **Overwrites:** after a successful (or skipped) ingest, `_supersede_stale_versions()` reads the key's current version via `HeadObject` and deletes vectors of every other `SUCCEEDED`/`SKIPPED` version (manifest `SUPERSEDED`, found via `manifest.list_versions()` = DynamoDB `Query`, requiring `dynamodb:Query` IAM). Using S3's current version, not "the version just processed", keeps out-of-order delivery safe. Cleanup is skipped for unversioned buckets and when the object is gone (404/delete marker). Not handled: permanently deleting the *current* version makes S3 serve the previous version again, whose vectors were already superseded.
 
 **Idempotency edge case:** `process_document()` skips only prior `SUCCEEDED` records, but the skip changes status to `SKIPPED`. A *third* delivery of the same event may therefore reindex. Preserve deterministic vector IDs and add explicit repeated-delivery tests before adjusting this behavior.
 
 ### 3.4 Locally exposed synchronous ingestion
 
-`POST /ingest` is only **registered** when `LOCAL_DEV=true`. It accepts multipart field `file`, validates a safe filename, supported extension, UTF-8, and upload size, then indexes chunks synchronously. It is guarded by `require_admin_api_key` unless local mode explicitly permits an absent key. This is **not** the deployed production ingestion path. API Gateway Terraform does not define a `/ingest` route.
+`POST /ingest` is only **registered** when `LOCAL_DEV=true`. It accepts multipart fields `file` and a **required** `tenant_id` (pattern + `ALLOWED_TENANT_IDS`; missing/malformed -> 422, unknown -> 400), validates a safe filename, supported extension, UTF-8, and upload size, then indexes chunks synchronously with `tenant_id` metadata and vector IDs `{tenant_id}/{filename}_{n}`. It is guarded by `require_admin_api_key` unless local mode explicitly permits an absent key. This is **not** the deployed production ingestion path. API Gateway Terraform does not define a `/ingest` route.
 
 ## 4. HTTP contract and error behavior
 
@@ -169,7 +169,7 @@ Defined in `backend/server.py`:
 | `POST /chat` | `{message: string, session_id?: string, tenant_id?: string}` -> `ChatResponse` | Currently public; caller supplies tenant |
 | `POST /embed` | `{text: string}` -> `{embedding: number[]}` | `x-api-key` admin gate |
 | `GET /conversation/{session_id}` | Returns persisted history | `x-api-key` admin gate |
-| `POST /ingest` | Multipart file -> indexed chunk count | Only in `LOCAL_DEV=true`; admin gate |
+| `POST /ingest` | Multipart `file` + `tenant_id` -> indexed chunk count | Only in `LOCAL_DEV=true`; admin gate |
 
 `ChatRequest.message`: length **1..MAX_MESSAGE_CHARS** (default **3000**). Session IDs: `^[A-Za-z0-9_-]{1,64}$`. Tenant IDs must match `^[A-Za-z0-9_-]{1,32}$` **and** one of `T001`, `T002`, `admin` from `common/config.py`.
 
@@ -344,8 +344,8 @@ Tests use deterministic fakes and monkeypatching instead of real AWS calls; add 
 These are findings from the provided implementation, not blanket claims that production currently fails:
 
 - **Authorization gap:** the public chat endpoint accepts user-chosen tenants including `admin`; no verified principal or session-owner authorization is present. Fix before treating this as a real multi-tenant production service.
-- **Worker vs API metadata mismatch:** event-driven worker has `source_key` but not `source_path`, while local `/ingest` has `source_path` but no tenant field. Retrieval grouping handles both (`_document_group_key`); worker sources still return `source_path: null`. Do not expose `source_key` publicly, and do not silently assume identical schemas.
-- **Version/delete lifecycle:** no cleanup of older vector versions on overwrite; S3 deletion event types/version IDs and manifestation of delete markers need real-event tests. A successful skip changes status to `SKIPPED`, which does not satisfy the next identical-delivery skip condition.
+- **Worker vs API metadata mismatch:** event-driven worker has `source_key` but not `source_path`, while local `/ingest` has `source_path` and `tenant_id` but no `source_key`. Retrieval grouping handles both (`_document_group_key`); worker sources still return `source_path: null`. Do not expose `source_key` publicly, and do not silently assume identical schemas.
+- **Version/delete lifecycle:** overwrites supersede older versions (see §3.3), but permanently deleting the current version does not re-index the now-current previous version; S3 deletion event types/version IDs and manifestation of delete markers need real-event tests. A successful skip changes status to `SKIPPED`, which does not satisfy the next identical-delivery skip condition.
 - **Import-time `.env` order:** `common.config` is imported ahead of `load_dotenv()` in `server.py`; avoid discrepancies between chat and ingestion configuration.
 - **RAG is feature-gated:** `rag_enabled=true` does not help until embedding and vector components are provisioned/configured. The uploaded development `terraform.tfvars` enables those resources, unlike the Terraform variable defaults; check the selected environment and deployment state. Do not promise source-grounded answers when `retrieval_used=false`.
 - **Hosting/region:** public S3 website origin uses HTTP to CloudFront; `destroy.sh` differs from `deploy.sh` in fallback region. Review security posture and region consistency before deployment.
