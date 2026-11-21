@@ -112,3 +112,46 @@ def test_retrieve_sources_no_filter_for_admin(server_module, monkeypatch):
     # Passing None explicitly should also result in no filter.
     server_module.retrieve_sources("query", tenant_id=None)
     assert captured_filter["value"] is None
+
+
+def test_worker_sources_with_same_filename_in_different_tenants_are_distinct(
+    server_module, monkeypatch
+):
+    """Worker vectors carry only ``source_key``. Admin retrieval (no tenant
+    filter) can return same-named files from different tenants; they must be
+    diversified as separate documents, and the internal S3 key must not leak."""
+    raw_hits = [
+        {
+            "key": f"{tenant}/faq/v1/{i}",
+            "distance": 0.1 + 0.01 * n,
+            "metadata": {
+                "tenant_id": tenant,
+                "title": "faq",
+                "source_key": f"incoming/Tenants/{tenant}/faq.md",
+                "chunk_text": f"faq answer {tenant} {i}",
+            },
+        }
+        for n, (tenant, i) in enumerate(
+            [("T001", 0), ("T001", 1), ("T002", 0), ("T002", 1)]
+        )
+    ]
+    monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
+    monkeypatch.setattr(
+        server_module, "search_text_chunks", lambda query, top_k, metadata_filter=None: raw_hits
+    )
+    monkeypatch.setattr(server_module, "MAX_CHUNKS_PER_DOC", 1)
+
+    sources = server_module.retrieve_sources("faq answer", fetch_n=5, return_n=3)
+
+    # One chunk per document, from both tenants (title-only grouping would yield 1).
+    assert {s.id.split("/")[0] for s in sources} == {"T001", "T002"}
+    assert len(sources) == 2
+
+    # The S3 object key is internal: not exposed as source_path, in the public
+    # JSON, or in the model prompt.
+    assert all(s.source_path is None for s in sources)
+    payload = str([s.model_dump() for s in sources])
+    prompt_block = server_module.build_retrieval_block(sources)
+    for leaked in ("incoming/", "Tenants/"):
+        assert leaked not in payload
+        assert leaked not in prompt_block

@@ -293,6 +293,25 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     """Yield markdown-aware text chunks (see common.chunking.chunk_text)."""
     return chunking.chunk_text(text, size=size, overlap=overlap)
 
+
+
+def _document_group_key(metadata: Dict) -> str:
+    """Return an internal identifier used to group chunks by source document.
+
+    ``/ingest`` vectors carry ``source_path``; ingestion-worker vectors carry only
+    ``source_key`` (the S3 object key). Grouping on ``title`` alone would merge
+    same-named documents from different folders/tenants. ``source_key`` is used
+    for grouping only and is never returned to clients or put in the prompt,
+    because it exposes the internal bucket layout and tenant folder names.
+    """
+    return (
+        metadata.get("source_path")
+        or metadata.get("source_key")
+        or metadata.get("title")
+        or "unknown"
+    )
+
+
 def index_text_chunk(
     text: str,
     vector_id: str,
@@ -491,7 +510,7 @@ def retrieve_sources(
         scored_items.append({
             "score": combined_score,
             "item": item,
-            "doc_id": metadata.get("source_path") or metadata.get("title") or "unknown"
+            "doc_id": _document_group_key(metadata)
         })
 
     # Sort by the new combined score (highest first)
