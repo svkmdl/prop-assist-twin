@@ -31,7 +31,7 @@ yarn-error.log*
 out/
 
 # guide stuff
-week2/
+docs/
 
 # conversation memory files
 memory/*
@@ -80,6 +80,9 @@ dist/
 .eggs/
 pip-wheel-metadata/
 *.egg
+
+# Local environment configuration
+.envrc
 
 # Virtual environments (repo-level and backend subfolder)
 venv/
