@@ -1,13 +1,13 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 import os
 import logging
 import re
 import hmac
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Tuple
+from typing import Annotated, Optional, List, Dict, Tuple
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -102,6 +102,7 @@ LOCAL_DEV = os.getenv("LOCAL_DEV", "false").lower() == "true"
 # Request Configuration
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "3000"))
 SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+TENANT_ID_PATTERN = r"^[A-Za-z0-9_-]{1,32}$"
 
 # Ingestion file configuration
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
@@ -117,6 +118,12 @@ logger = logging.getLogger(__name__)
 if USE_S3:
     s3_client = boto3.client("s3")
 
+def check_allowed_tenant(v: str) -> str:
+    """Shared allowlist check so /chat and /ingest reject unknown tenants alike (422)."""
+    if v not in config.ALLOWED_TENANT_IDS:
+        raise ValueError(f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}")
+    return v
+
 # Request/Response models
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
@@ -127,17 +134,13 @@ class ChatRequest(BaseModel):
     )
     tenant_id: str = Field(
         default=config.DEFAULT_TENANT_ID,
-        pattern=r"^[A-Za-z0-9_-]{1,32}$",
+        pattern=TENANT_ID_PATTERN,
     )
 
     @field_validator("tenant_id")
     @classmethod
     def validate_tenant_id(cls, v: str) -> str:
-        if v not in config.ALLOWED_TENANT_IDS:
-            raise ValueError(
-                f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}"
-            )
-        return v
+        return check_allowed_tenant(v)
 
 class ChatResponse(BaseModel):
     response: str
@@ -292,6 +295,30 @@ def get_embedding(text: str) -> List[float]:
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     """Yield markdown-aware text chunks (see common.chunking.chunk_text)."""
     return chunking.chunk_text(text, size=size, overlap=overlap)
+
+
+
+def _document_group_key(metadata: Dict) -> str:
+    """Return an internal identifier used to group chunks by source document.
+
+    ``/ingest`` vectors carry ``source_path``; ingestion-worker vectors carry only
+    ``source_key`` (the S3 object key). Grouping on ``title`` alone would merge
+    same-named documents from different folders/tenants. ``source_key`` is used
+    for grouping only and is never returned to clients or put in the prompt,
+    because it exposes the internal bucket layout and tenant folder names.
+
+    The tenant is part of the key so that same-named ``/ingest`` uploads for
+    different tenants stay distinct under unfiltered (admin) retrieval.
+    """
+    path = (
+        metadata.get("source_path")
+        or metadata.get("source_key")
+        or metadata.get("title")
+        or "unknown"
+    )
+    tenant_id = metadata.get("tenant_id")
+    return f"{tenant_id}:{path}" if tenant_id else path
+
 
 def index_text_chunk(
     text: str,
@@ -491,7 +518,7 @@ def retrieve_sources(
         scored_items.append({
             "score": combined_score,
             "item": item,
-            "doc_id": metadata.get("source_path") or metadata.get("title") or "unknown"
+            "doc_id": _document_group_key(metadata)
         })
 
     # Sort by the new combined score (highest first)
@@ -616,7 +643,21 @@ async def health_check():
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
-async def ingest_file(file: UploadFile = File(...)):
+async def ingest_file(
+    file: Annotated[UploadFile, File()],
+    tenant_id: Annotated[
+        str, Form(pattern=TENANT_ID_PATTERN), AfterValidator(check_allowed_tenant)
+    ],
+):
+    # Without tenant_id metadata a vector is unreachable for tenant-filtered
+    # retrieval, so the tenant is required and checked against the allowlist.
+    #
+    # TRUST MODEL: the target partition is chosen by the operator calling this
+    # local-only, admin-gated route (like the S3 folder for the worker). It is
+    # NOT a pattern for user-facing paths: with LOCAL_DEV=true and no
+    # ADMIN_API_KEY it is plain request input. Production scope must come from
+    # server-verified identity claims (CLAUDE.md §9.1, §9.4, §13.3.1).
+
     filename = Path(file.filename or "").name
     if not SAFE_FILENAME_PATTERN.fullmatch(filename):
         allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
@@ -636,9 +677,12 @@ async def ingest_file(file: UploadFile = File(...)):
         with ThreadPoolExecutor(max_workers=INGESTION_MAX_WORKERS) as executor:
             for count, chunk in enumerate(chunk_text(content)):
 
-                vector_id = f"{filename}_{count}"
+                # Tenant-prefixed so the same filename uploaded for two tenants
+                # does not overwrite the other tenant's vectors.
+                vector_id = f"{tenant_id}/{filename}_{count}"
 
                 metadata = {
+                    "tenant_id": tenant_id,
                     "source_path": f"api_upload/{filename}",
                     "title": filename.rsplit('.', 1)[0],
                     "doc_type": next(s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)),

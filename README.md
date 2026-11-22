@@ -169,14 +169,16 @@ In deployed environments, document ingestion is fully decoupled from the chat La
    - reads the object from S3 and validates extension, size, and UTF-8 content,
    - computes a SHA-256 checksum and checks the DynamoDB manifest for idempotency,
    - chunks the content, embeds each chunk via the SageMaker endpoint, and writes vectors to S3 Vectors with deterministic IDs,
-   - updates the manifest status and chunk count.
+   - updates the manifest status and chunk count;
+   - removes vectors of every other indexed version of the same key that is not S3's current version (manifest `SUPERSEDED`), so overwritten documents do not leave stale chunks searchable.
 
 ### Failure handling
 
 | Scenario | Behavior |
 | --- | --- |
 | Invalid file (bad extension, non-UTF-8, empty, too large) | Manifest marked `FAILED`; message acknowledged (no retry) |
-| Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing |
+| Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing (stale-version cleanup is re-attempted) |
+| Overwrite (new S3 version of an indexed key) | New version indexed, then older versions' vectors deleted and marked `SUPERSEDED`. The current version is read via `HeadObject`, so out-of-order SQS delivery cannot let an old version win. Skipped if the bucket is unversioned or the object no longer exists |
 | Embedding or vector-write failure | Message retried via SQS; after `max_receive_count`, routed to the DLQ |
 | Throttling from the serverless embedding endpoint | Absorbed by adaptive botocore retries (`EMBEDDING_MAX_ATTEMPTS`) |
 
@@ -186,7 +188,7 @@ Vectors use deterministic IDs of the form `{tenant_id}/{doc_id}/{source_version_
 
 ### DynamoDB manifest
 
-The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `SKIPPED`.
+The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, and `SUPERSEDED`.
 
 ### Observability
 
@@ -350,6 +352,7 @@ curl -X POST http://localhost:8000/embed \
 
 curl -X POST http://localhost:8000/ingest \
   -H "x-api-key: $ADMIN_API_KEY" \
+  -F "tenant_id=T001" \
   -F "file=@data/kb/company_faq.md"
 ```
 
@@ -669,7 +672,7 @@ Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `
 
 ### `POST /ingest` admin (local only)
 
-Accepts a markdown upload, applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata to S3 Vectors. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
+Accepts a markdown upload plus a required `tenant_id` form field (one of the allowed tenants, e.g. `T001`), applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata (including `tenant_id`, so tenant-filtered chat retrieval can find them) to S3 Vectors under `{tenant_id}/{filename}_{chunk}` IDs. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
 
 ### `GET /conversation/{session_id}` admin
 

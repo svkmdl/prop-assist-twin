@@ -236,7 +236,8 @@ resource "aws_iam_policy" "rag_ingest_worker" {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
-          "dynamodb:UpdateItem"
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
         ]
         Resource = aws_dynamodb_table.rag_ingestion_manifest[0].arn
       },

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -45,16 +46,42 @@ class FakeBody:
 
 
 class FakeS3:
-    """Minimal S3 stub backed by an in-memory ``key -> (bytes, version)`` map."""
+    """Minimal versioned S3 stub.
+
+    ``objects`` maps ``key -> (bytes, current_version)``. Every version ever
+    stored is kept in ``history`` so older versions stay readable by VersionId.
+    """
 
     def __init__(self, objects):
         self.objects = objects
+        self.history = {
+            (key, version): body for key, (body, version) in objects.items()
+        }
+
+    def put(self, key, body, version):
+        """Simulate an overwrite: ``version`` becomes the current version."""
+        self.objects[key] = (body, version)
+        self.history[(key, version)] = body
+
+    def remove(self, key):
+        """Simulate a delete marker: no current version, history retained."""
+        self.objects.pop(key, None)
 
     def get_object(self, Bucket, Key, VersionId=None):
+        if VersionId is not None and (Key, VersionId) in self.history:
+            return {"Body": io.BytesIO(self.history[(Key, VersionId)]), "VersionId": VersionId}
         if Key not in self.objects:
             raise RuntimeError(f"NoSuchKey: {Key}")
         body, version = self.objects[Key]
         return {"Body": io.BytesIO(body), "VersionId": version}
+
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
+        _body, version = self.objects[Key]
+        return {"VersionId": version}
 
 
 class FakeDynamo:
@@ -71,6 +98,23 @@ class FakeDynamo:
     def put_item(self, TableName, Item):
         composite = (Item["tenant_id"]["S"], Item["source_sk"]["S"])
         self.items[composite] = Item
+
+    def query(self, TableName, KeyConditionExpression, ExpressionAttributeValues,
+              ConsistentRead=None, ExclusiveStartKey=None):
+        assert KeyConditionExpression == "tenant_id = :t AND begins_with(source_sk, :p)"
+        tenant = ExpressionAttributeValues[":t"]["S"]
+        prefix = ExpressionAttributeValues[":p"]["S"]
+        matches = [
+            item for (t, sk), item in sorted(self.items.items())
+            if t == tenant and sk.startswith(prefix)
+        ]
+        # Return one item per page to exercise pagination.
+        start = int(ExclusiveStartKey["i"]["N"]) if ExclusiveStartKey else 0
+        page = matches[start:start + 1]
+        response = {"Items": page}
+        if start + 1 < len(matches):
+            response["LastEvaluatedKey"] = {"i": {"N": str(start + 1)}}
+        return response
 
 
 class FakeSageMaker:
@@ -345,6 +389,166 @@ class TestDeletion:
 
         assert result == {"batchItemFailures": []}
         assert len(mods.vectors.puts) >= 1
+
+
+DOC = "incoming/tenant-a/doc.md"
+
+
+def _vector_ids(mods):
+    return {p["vectors"][0]["key"] for p in mods.vectors.puts}
+
+
+def _deleted_ids(mods):
+    return {key for d in mods.vectors.deletes for key in d["keys"]}
+
+
+def _status(mods, version, key=DOC):
+    return mods.manifest.get_record("tenant-a", f"{key}#{version}")["status"]
+
+
+class TestOverwriteSupersedes:
+    def test_new_version_removes_previous_version_vectors(self, ingestion):
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", "v1")})
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        v1_ids = _vector_ids(mods)
+        assert v1_ids and mods.vectors.deletes == []
+
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+        result = mods.worker.handler(
+            make_event("rag-docs", DOC, version_id="v2", message_id="m2"), None
+        )
+
+        assert result == {"batchItemFailures": []}
+        v2_ids = _vector_ids(mods) - v1_ids
+        assert v2_ids and all(i.startswith("tenant-a/doc/v2/") for i in v2_ids)
+        assert _deleted_ids(mods) == v1_ids
+        assert _status(mods, "v1") == "SUPERSEDED"
+        assert _status(mods, "v2") == "SUCCEEDED"
+
+    def test_out_of_order_delivery_keeps_current_version(self, ingestion):
+        """v2 (current) is processed before the late v1 event; v1 must not win."""
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", "v1")})
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v2"), None)
+        assert mods.vectors.deletes == []
+
+        result = mods.worker.handler(
+            make_event("rag-docs", DOC, version_id="v1", message_id="m-late"), None
+        )
+
+        assert result == {"batchItemFailures": []}
+        deleted = _deleted_ids(mods)
+        assert deleted and all(i.startswith("tenant-a/doc/v1/") for i in deleted)
+        assert _status(mods, "v1") == "SUPERSEDED"
+        assert _status(mods, "v2") == "SUCCEEDED"
+
+    def test_superseded_version_delete_event_is_noop(self, ingestion):
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", "v1")})
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v2"), None)
+        deletes_before = len(mods.vectors.deletes)
+
+        result = mods.worker.handler(
+            make_event(
+                "rag-docs", DOC, version_id="v1", event_name="ObjectRemoved:Delete"
+            ),
+            None,
+        )
+
+        assert result == {"batchItemFailures": []}
+        assert len(mods.vectors.deletes) == deletes_before
+        assert _status(mods, "v1") == "SUPERSEDED"
+
+    def test_failed_old_version_is_left_alone(self, ingestion):
+        mods = ingestion(objects={DOC: (b"", "v1")})  # empty -> FAILED
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        assert _status(mods, "v1") == "FAILED"
+
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v2"), None)
+
+        assert mods.vectors.deletes == []
+        assert _status(mods, "v1") == "FAILED"
+
+    def test_object_gone_skips_cleanup(self, ingestion):
+        """If the key has no current version (deleted), nothing is superseded."""
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", "v1")})
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+        mods.s3.remove(DOC)
+
+        result = mods.worker.handler(
+            make_event("rag-docs", DOC, version_id="v2", message_id="m2"), None
+        )
+
+        assert result == {"batchItemFailures": []}
+        assert mods.vectors.deletes == []
+        assert _status(mods, "v1") == "SUCCEEDED"
+
+    def test_unversioned_object_skips_cleanup(self, ingestion):
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", None)})
+        mods.worker.handler(make_event("rag-docs", DOC, version_id=None), None)
+        mods.s3.put(DOC, b"# New\n\nnew body", None)
+        result = mods.worker.handler(
+            make_event("rag-docs", DOC, version_id=None, message_id="m2"), None
+        )
+
+        assert result == {"batchItemFailures": []}
+        assert mods.vectors.deletes == []
+
+    def test_head_object_error_other_than_404_is_retried(self, ingestion):
+        mods = ingestion(objects={DOC: (b"# Doc\n\nbody", "v1")})
+
+        def boom(**kwargs):
+            raise ClientError(
+                {"Error": {"Code": "SlowDown", "Message": "throttled"}}, "HeadObject"
+            )
+
+        mods.s3.head_object = boom
+        result = mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+
+        assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+
+    def test_cleanup_failure_is_retried_and_healed_on_redelivery(self, ingestion):
+        mods = ingestion(objects={DOC: (b"# Old\n\nold body", "v1")})
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        v1_ids = _vector_ids(mods)
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+
+        mods.vectors.fail_delete = True
+        event = make_event("rag-docs", DOC, version_id="v2", message_id="m2")
+        assert mods.worker.handler(event, None) == {
+            "batchItemFailures": [{"itemIdentifier": "m2"}]
+        }
+        assert _status(mods, "v1") == "SUCCEEDED"
+
+        # SQS redelivers; v2 is already SUCCEEDED so it is skipped, but the
+        # stale v1 vectors are still cleaned up.
+        mods.vectors.fail_delete = False
+        assert mods.worker.handler(event, None) == {"batchItemFailures": []}
+        assert _deleted_ids(mods) == v1_ids
+        assert _status(mods, "v1") == "SUPERSEDED"
+        assert _status(mods, "v2") == "SKIPPED"
+
+    def test_only_exact_source_key_is_superseded(self, ingestion):
+        """A key that merely shares the ``<key>#`` prefix must not be touched."""
+        lookalike = f"{DOC}#copy.md"
+        mods = ingestion(
+            objects={
+                lookalike: (b"# Other\n\nother body", "x1"),
+                DOC: (b"# Old\n\nold body", "v1"),
+            }
+        )
+        mods.worker.handler(make_event("rag-docs", lookalike, version_id="x1"), None)
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v1"), None)
+        mods.s3.put(DOC, b"# New\n\nnew body", "v2")
+        mods.worker.handler(make_event("rag-docs", DOC, version_id="v2"), None)
+
+        assert _status(mods, "x1", key=lookalike) == "SUCCEEDED"
+        assert all("/v1/" in i for i in _deleted_ids(mods))
+        assert _status(mods, "v1") == "SUPERSEDED"
 
 
 class TestValidationFailures:
