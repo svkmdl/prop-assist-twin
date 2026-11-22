@@ -30,8 +30,9 @@ yarn-error.log*
 .out/
 out/
 
-# guide stuff
-docs/
+# guide stuff: private planning notes only. The rest of docs/ (ADRs, use case,
+# security, runbook) is committed as proof artifacts (CLAUDE.md §13.7).
+docs/prop_assist_6_month_roadmap.md
 
 # conversation memory files
 memory/*
