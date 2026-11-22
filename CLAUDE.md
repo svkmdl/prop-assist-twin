@@ -4,9 +4,30 @@ This is the repository-level operating guide for Claude Code and other coding ag
 
 > Review basis: the uploaded project archive (`backend/`, `frontend/`, `terraform/`, `scripts/`) **plus separately supplied root `README.md` and `deploy.yml`**, which documents the `.github/workflows/deploy.yml` workflow. The archive did not itself include the root README, workflow folder, `.gitignore`, or the README-mentioned `temp/build_corpus_markdown.py`. The CI section below describes the supplied YAML, not a verified GitHub run; compare all externally supplied files with the real checkout before editing. No live AWS operations were executed as part of this review.
 
+## 0. Agent operating brief: deliver business value and measurable engineering quality
+
+**Project north star (November 2026–May 2027):** evolve this AWS-native RAG PoC into a **Property Operations Copilot** that reliably supports property-management workflows. The core scenario is an authorized property manager handling a renter inquiry: retrieve approved building, lease and maintenance documents; read scoped property and ticket records; provide a verifiably grounded recommendation; draft a maintenance case; require human approval before creating a ticket; and record an audit trail. Use only synthetic or explicitly authorized data in demos and documentation.
+
+**Success means measurable outcomes:** deliver a useful business workflow supported by labeled evaluation data, before/after quality results, secure data boundaries, reliable integrations, operational observability, cost/latency tradeoffs, documented decisions and a maintainable handover. Prioritize proven reliability and business usefulness over the number of AI frameworks. This is a target, **not** a statement that the planned features already exist.
+
+**Read order for every nontrivial task:** this brief -> current repo code and tests -> §9 security -> §13 target/roadmap -> the affected component sections. If a checked-out `docs/project-roadmap.md` exists, use it as the dated planning log alongside §13, **not** as evidence of implemented behavior. If the two roadmaps disagree, surface the discrepancy and use the latest owner-approved priority; do not silently replace the current milestone.
+
+**Active milestone — Milestone 1: Trustworthy RAG (November–December 2026).** Follow this sequence, not a parallel feature buffet:
+
+1. **P0 containment FIRST:** prevent anonymous access to cross-partition `admin` retrieval or non-synthetic customer data in any publicly reachable demo. The UI picker and metadata filters are not authorization. Keep public access disabled/restricted until a safe single-scope synthetic demo or verified authorization is in place; write negative access tests. Full OIDC/role-based authorization is the Month 3 workstream, not a reason to leave a public exposure open meanwhile.
+2. **P1 evaluation foundation:** verify and repair golden JSONL fixtures and the eval runner in the *actual checkout*, create isolated evaluation sessions, and add automated fixture validation. Earlier assessments conflict about whether golden JSONL parses correctly; **test it before changing it**.
+3. **P1 use-case and corpus:** define a specific property-manager maintenance/policy inquiry, measurable acceptance criteria, fictional German-language policies/contracts/SOPs and labeled questions with expected evidence and refusals.
+4. **P1 measured baseline:** publish reproducible retrieval, grounding/citation, refusal, access-boundary, latency, error and cost results, plus a categorized failure analysis. Improve retrieval only after this baseline exists.
+
+**Scope-control rule:** before proposing a new feature, name (a) the target business problem, (b) the required system capability or architectural improvement, (c) the metric/test/verification artifact, (d) the current month/gate and (e) why it is necessary now. If these cannot be answered, park it. Do not introduce agents, MCP servers, fine-tuning, graph RAG, a new vector database, Kubernetes or multi-cloud without a demonstrated requirement. See §13.6.
+
+**Change discipline:** one scoped improvement at a time; preserve existing contracts; add tests and a measurable outcome; keep a short decision note for nontrivial choices. Do not claim feature completion, security or benchmark outcomes unless verified. No live AWS write, deploy, upload, `terraform apply` or destroy without the owner's explicit approval (§8–9).
+
 ## 1. Purpose and stack
 
 A proof-of-concept AI real-estate assistant for **XYZ Immobilienverwaltung GmbH**, presenting the assistant persona **Marie Stein**. The client is a static Next.js chat interface. The server is a separate Python/FastAPI API, hosted on AWS Lambda via Mangum in deployment. Conversations use Bedrock Nova; optional retrieval-augmented generation (RAG) grounds answers in tenant-scoped markdown documents embedded by SageMaker and indexed in S3 Vectors. Document indexing is primarily event-driven and separate from chat requests.
+
+**Direction:** this PoC is being evolved incrementally, by about **May 2027**, into the Property Operations Copilot described in §0. The target adds verified identity and request classification, RAG over contracts, policies and SOPs, structured property/renter/ticket data, guardrailed grounded answers, and human-approved ticket creation with an audit trail. Today only the RAG + answer path exists. **Safety containment and evaluation come before feature expansion.** Read **§13** before designing anything that touches identity, data access, answer generation or external actions. Note the two meanings of "tenant" in §13.1.
 
 | Layer | Actual implementation |
 | --- | --- |
@@ -234,6 +255,8 @@ API_URL=http://localhost:8000 uv run python eval_chat.py
 
 `EVAL_CASES` and `EVAL_TIMEOUT_SECONDS` override case path and request timeout. `eval_chat.py` loads JSONL and checks response text/source/citation heuristics. Its four cases are **not** deterministic isolated unit tests, and passing them does not establish grounding correctness.
 
+**Milestone 1 evaluation contract (planned, not implemented):** validate JSONL fixture parsing in CI, give each case an independent session, separate fast deterministic/security tests from live model-quality evaluation, and emit machine-readable runs plus a Markdown summary with dataset/version, model/config, retrieval Recall@k, grounding/citation, refusal, isolation, p50/p95 latency, errors and measured usage/cost. Reference expected source document IDs, not just answer keywords. Do not claim the fixture is malformed solely from an earlier report: the archive review above says parsing passed; rerun the check on the actual checkout. Likewise verify the README-versus-runner API environment variable spelling before editing. Proposed output paths are in §13.7.
+
 **Observed verification for this archive:** Python syntax compilation, `bash -n` for both scripts, frontend JSON parsing, and JSONL parsing passed. The full pytest, npm, Terraform and real AWS integration checks were **not executed** in this review environment. In particular Python 3.12 was unavailable there; do not claim those checks passed until re-run on a configured machine.
 
 ## 7. Environment and configuration ownership
@@ -314,7 +337,8 @@ Treat the provided `deploy.yml` as the content of `.github/workflows/deploy.yml`
 
 ## 9. Security and data-isolation rules (mandatory)
 
-1. **PoC tenant selection is NOT production authentication.** `/chat` is currently unauthenticated; user-controlled `tenant_id` can be `admin`, which removes the vector tenant filter. The frontend exposes this choice. Stored-session tenant locking does not establish user ownership; callers who know a session ID can supply it to `/chat`. Production hardening needs server-verified identity/tenant claims, session ownership checks, and a guarded admin role.
+1. **PoC tenant selection is NOT production authentication.** `/chat` is currently unauthenticated; user-controlled `tenant_id` can be `admin`, which removes the vector tenant filter. The frontend exposes this choice. Stored-session tenant locking does not establish user ownership; callers who know a session ID can supply it to `/chat`. Production hardening needs server-verified identity/tenant claims, session ownership checks, and a guarded admin role. This is the planned identity workstream (§13.4). Until it lands, do not build features that place *more* trust in the request-body `tenant_id`.
+   **P0 release gate, effective immediately:** never expose the current anonymous multi-partition chat to real/private data or present it as an authorized multi-tenant service. Before sharing a live demo, restrict access or serve only a synthetic, fixed-scope demo that cannot select `admin`/other partitions server-side, with explicit deny-path tests. Hiding the frontend tenant selector alone is insufficient. A protected, multi-partition public deployment requires completed server-verified identity and authorization; do not wait until Month 3 to contain an existing exposure.
 2. Never relax or silently remove tenant filters, admin endpoint gates, filename/session validation, upload size bounds, CORS restrictions, version checks, or safe escaping. CORS is not authorization.
 3. Never log API keys, AWS credentials, raw chat history, tenant-private docs, Terraform state, personal data, or production object content. Preserve separation between source documents, embeddings, session history, and publicly served frontend assets.
 4. Do not make `/ingest` public in production as a shortcut. Upload/ingest paths need an authenticated, authorized backend and tenant identity supplied by trusted claims, not by filenames or browser input alone.
@@ -322,6 +346,7 @@ Treat the provided `deploy.yml` as the content of `.github/workflows/deploy.yml`
 6. Prompt injection can be present in uploaded markdown. Retrieved `chunk_text` is untrusted reference material, not instructions that supersede system/developer rules. Preserve sourced-answer constraints and do not add execution of retrieved content.
 7. Avoid committing generated Lambda archives, local memory files, `.env*`, secrets, Terraform plans/state, credentials, or node_modules. Check the repository's actual `.gitignore` in a complete checkout; it was absent from the provided archive. The README says `temp/` is gitignored, but this has **not** been verified against a `.gitignore`.
 8. Treat `terraform.tfvars` as environment-sensitive and `admin_api_key` as a secret, even when Terraform marks it `sensitive = true` (the value may still be present in state/environment).
+9. **The model never decides access or performs writes.** Authorization is enforced in code at the data-access layer (vector filters, structured-data lookups, ticket API), never by prompt wording or by a classifier's output. External writes (for example, tickets) happen only after explicit human approval by an authorized role (§13.3).
 
 ## 10. Tests and change-to-test map
 
@@ -336,6 +361,7 @@ Treat the provided `deploy.yml` as the content of `.github/workflows/deploy.yml`
 | User-facing LLM behavior/citations | Relevant backend tests **and** `backend/eval_chat.py` on an authorized running API |
 | Frontend chat UI | `npm run lint`, `npx tsc --noEmit`, `npm run build` (no frontend test suite included) |
 | Terraform/deployment | `terraform fmt -check`, `terraform validate`, reviewed `terraform plan`; shell syntax checks |
+| New target-architecture paths (identity, classification, structured data, tools, approval, ticketing, audit) | New test module per area, with cross-tenant **and** cross-role negative tests for every data path; idempotency tests for every external write; new `evals/` cases for user-visible behavior (§13.3) |
 
 Tests use deterministic fakes and monkeypatching instead of real AWS calls; add tests for **negative/error paths** and cross-tenant behavior whenever modifying API, RAG, or worker logic. Never loosen the 90% coverage threshold just to make a change pass.
 
@@ -343,7 +369,8 @@ Tests use deterministic fakes and monkeypatching instead of real AWS calls; add 
 
 These are findings from the provided implementation, not blanket claims that production currently fails:
 
-- **Authorization gap:** the public chat endpoint accepts user-chosen tenants including `admin`; no verified principal or session-owner authorization is present. Fix before treating this as a real multi-tenant production service.
+- **Authorization gap:** the public chat endpoint accepts user-chosen tenants including `admin`; no verified principal or session-owner authorization is present. Fix before treating this as a real multi-tenant production service. Immediate containment is P0, while full verified identity is scheduled for Month 3 (§13.4).
+- **No observability for cost or tracing:** `call_bedrock()` discards the Converse response's `usage` token counts, there is no request/correlation ID, and answer generation runs at `temperature: 0.7`. These belong in the lightweight Month 1 instrumentation and Month 5 LLMOps milestones (§13.4).
 - **Worker vs API metadata mismatch:** event-driven worker has `source_key` but not `source_path`, while local `/ingest` has `source_path` and `tenant_id` but no `source_key`. Retrieval grouping handles both (`_document_group_key`); worker sources still return `source_path: null`. Do not expose `source_key` publicly, and do not silently assume identical schemas.
 - **Version/delete lifecycle:** overwrites supersede older versions (see §3.3), but permanently deleting the current version does not re-index the now-current previous version; S3 deletion event types/version IDs and manifestation of delete markers need real-event tests. A successful skip changes status to `SKIPPED`, which does not satisfy the next identical-delivery skip condition.
 - **Import-time `.env` order:** `common.config` is imported ahead of `load_dotenv()` in `server.py`; avoid discrepancies between chat and ingestion configuration.
@@ -358,12 +385,199 @@ These are findings from the provided implementation, not blanket claims that pro
 
 ## 12. Workflow for future Claude Code changes
 
-1. Read the relevant source, its tests, and the corresponding Terraform/frontend config **before** editing. Search for all callers and duplicated config surfaces (especially `server.py` vs `common/config.py`, `pyproject.toml` vs `requirements.txt`).
-2. State the intended behavior and relevant invariants. For multi-tenant or ingestion changes, explicitly trace session ownership, tenant metadata, S3 object version, manifest status and vector IDs.
-3. Make a small, focused change. Keep the API request/response contract and citation mapping consistent between `server.py`, `common/models.py`, tests, and `frontend/components/twin.tsx`.
-4. Add/update regression tests, particularly for failures, tenant boundaries, duplicate SQS deliveries and deletes. Mock AWS; do not generate real resources during tests.
-5. Run relevant tests, the full backend coverage suite, frontend checks/build, and Terraform validation when applicable. Report precisely what did and did not run; never manufacture passing results.
-6. Review privacy, security, IAM, cost, regional configuration, cold-start effects and deployment consequences. Seek explicit approval for `apply`, `destroy`, uploads, writes to AWS or other consequential external actions.
-7. Update this file only when implementation behavior, commands, architecture or conventions truly change. Summarize modified files, checks and remaining risks in the final handoff.
+1. **Locate the next uncompleted approved milestone in §13.4 and name its proof artifact.** P0 security containment preempts the roadmap; otherwise prioritize the current month's smallest measurable deliverable. Explain why the proposed change advances the property-operations use case and which measurable system capability it improves. Do not start a later month's feature without an explicit request or documented dependency.
+2. Read the relevant source, its tests, and the corresponding Terraform/frontend config **before** editing. Search for all callers and duplicated config surfaces (especially `server.py` vs `common/config.py`, `pyproject.toml` vs `requirements.txt`).
+3. State the intended behavior and relevant invariants. For multi-tenant or ingestion changes, explicitly trace session ownership, tenant metadata, S3 object version, manifest status and vector IDs.
+4. Place the change in the target architecture (§13): name the layer and increment it serves. Do not take shortcuts the target would have to undo, such as trusting body-supplied scope, letting the model trigger writes, or reusing `tenant_id` for renters. If the change needs an open decision from §13.5, propose options and ask instead of picking one.
+5. Make a small, focused change. Keep the API request/response contract and citation mapping consistent between `server.py`, `common/models.py`, tests, and `frontend/components/twin.tsx`.
+6. Add/update regression tests, particularly for failures, tenant boundaries, duplicate SQS deliveries and deletes. Mock AWS; do not generate real resources during tests.
+7. Run relevant tests, the full backend coverage suite, frontend checks/build, and Terraform validation when applicable. Report precisely what did and did not run; never manufacture passing results.
+8. Review privacy, security, IAM, cost, regional configuration, cold-start effects and deployment consequences. Seek explicit approval for `apply`, `destroy`, uploads, writes to AWS or other consequential external actions.
+9. Update this file only when implementation behavior, commands, architecture or conventions truly change. Summarize modified files, checks and remaining risks in the final handoff.
 
 **Priority when information conflicts:** current source and tests > verified infrastructure plan/runtime evidence > root `README.md` and independently provided `deploy.yml` (after checking against the checkout) > this `CLAUDE.md`. Verify before deleting or rewriting existing behavior.
+
+## 13. Target architecture and incremental roadmap (November 2026–May 2027)
+
+**Purpose:** deliver **one** measurable, secure, end-to-end property-operations workflow, with reproducible documentation and clear operational handover—not a collection of disconnected AI features. This section is the agent's prioritized engineering plan. Time windows are planning targets, not claims that milestones are completed. The owner may rebaseline dates as needed; record changes and reasons (§13.8).
+
+### Target architecture (future state; not all implemented)
+
+```text
+Tenant/renter inquiry or property-manager request
+  -> Authenticated identity + server-enforced scope (role, organization, property)
+  -> Request classification [informational / record lookup / maintenance action / other]
+       -> Authorized RAG retrieval             + Authorized structured-data reads
+          (contracts, policies, SOPs)             (property, renter, tickets, vendors)
+       -> Grounded answer + cited evidence + guardrails + evaluation
+       -> Maintenance draft (not an external write)
+       -> Authorized property-manager review / explicit approval
+       -> Idempotent ticket API submission -> append-only audit trail
+
+Cross-cutting at every stage:
+  request correlation, redacted traces/logs, quality monitoring, token/cost/latency,
+  tests, permission checks, resilience, rollback and GDPR-aware data handling.
+```
+
+**Example user journey:** a renter reports water damage; a property manager asks the assistant to triage it. The system retrieves the applicable building maintenance policy and vendor SOP, checks a scoped building/tenant record, produces a cited recommendation, drafts a maintenance ticket, and sends it only after an authorized human approves. Demonstrate with **fictional properties, renters and tickets**. The existing real-estate assistant persona/UI may evolve, but avoid a broad frontend redesign before evidence of usefulness exists.
+
+### 13.1 Terminology: "tenant" has two meanings
+
+- **In the current code**, `tenant_id` (`T001`, `T002`, `admin`) is a **data-isolation partition** for vector metadata, manifest keys, S3 prefixes and sessions. The code does not define what `T001` stands for in business terms (client organization, portfolio or individual renter). Confirm this with the owner before designing identity or new record identifiers.
+- **In the target business workflow**, "tenant" means a **renter (Mieter)**. Renter/occupant identity is not necessarily the data-isolation partition.
+- **Rule:** never silently reuse `tenant_id` to mean renter identity or infer a renter's access scope from a filename. New organization/property/renter identifiers must be explicitly modeled and named before API/storage migrations; preserve compatibility or document migration.
+
+### 13.2 Current implementation versus target
+
+| Layer | Present in reviewed code | Target gap / proof |
+| --- | --- | --- |
+| User entry | Static Next.js chat with selectable `T001`/`T002`/`admin` | Authenticated renter/property-manager journeys; deny untrusted scope selection |
+| Identity and access | `/chat` anonymous; user-provided `tenant_id`; sessions tenant-bound but not user-owned | P0 demo containment now, verified principal/session ownership, enforced partition/property/role scopes |
+| Classification | Single rewrite -> retrieve -> answer path | Narrow typed routing for question / record lookup / action request / escalation |
+| RAG | Markdown, SageMaker embeddings, S3 Vectors, lexical rerank, citation labels; broad admin retrieval | Evaluation-proven retrieval, approved property policies/SOPs/contracts, access/effective-date metadata, multilingual quality and document lifecycle |
+| Structured records | No production property/renter/ticket lookup tool | One simulated/authorized integration with typed, read-only property and ticket data |
+| Answer quality | Prompt-level grounding, four heuristic live eval cases, no proven source-grounding scorer | Golden benchmark; evidence-linked sources, refusal/guardrail tests, measured before/after quality |
+| Action workflow | No ticket draft, approval or external write | Structured draft, authorized human confirmation, idempotent API submission, audit |
+| Operations | Ingestion alarms; limited answer-side tracing/cost measurement | Correlation IDs, redacted traces, token usage, cost/latency/quality metrics, smoke tests, runbook |
+
+**Do not misreport** planned target behavior as implemented. The repo's source/tests and a verified deployed environment take precedence over roadmap expectations (§12).
+
+### 13.3 Binding architecture and security rules
+
+1. **Authorization is independent of AI.** Scope and role must come from server-verified identity, never the frontend picker, body `tenant_id`, retrieved documents, classifier or model. Enforce checks in retrieval, session load, structured reads, ticket drafts, approvals and submissions. Restrict cross-partition `admin` access to an authorized role; until then keep public cross-partition data inaccessible (§9).
+2. **Static frontend reality (§5):** the exported Next.js UI has no server secrets or server-side session service. If selecting OAuth2/OIDC, validate tokens at the gateway and/or FastAPI and design browser token handling securely. No credentials in `NEXT_PUBLIC_*`.
+3. **Classification routes; it does not authorize.** A bad or prompt-injected classification must not escalate scope or bypass a review step.
+4. **Only narrow, typed, read-only record tools** until the approval flow is complete (for example, `get_property(property_id)` and `get_ticket(ticket_id)`). Validate arguments, bind access to the trusted principal, and prohibit arbitrary model-generated SQL or generic unrestricted APIs.
+5. **The model cannot create an external ticket.** It can draft structured content with explicit uncertainty. An authorized property manager must see exactly what will be sent and approve it via a separate authenticated request. Use idempotency keys, replay-safe handling and meaningful failure states.
+6. **Audit is append-only and independent of mutable chat memory.** Record relevant actor IDs, consent/approval decision, referenced source/record IDs, timestamps, model/config version, action outcome and external ticket ID while minimizing personal data and secrets. Establish retention/deletion policy before real personal data is considered (§9).
+7. **Grounding is inspectable.** A factual answer must cite the evidence it used, or clearly state uncertainty/insufficient information. Validate emitted `[S#]` against actually supplied sources; introduce separate typed record citations only with an explicit backward-compatible API change.
+8. **End-to-end operability grows incrementally.** Propagate a correlation ID through rewriting, retrieval, Bedrock, record tools and actions; collect Bedrock usage and model ID; measure p50/p95, success, errors, cost, and redact sensitive text from traces/logs. Month 5 **hardens** these capabilities rather than introducing security or metrics for the first time.
+9. **Ship tests and evaluation with each slice.** Deterministic/unit/security tests are gating; LLM quality tests need versioned fixtures, repetition where relevant, recorded settings and a controlled budget. Add adversarial/cross-scope negatives, retries and idempotency tests; never weaken the 90% coverage gate to ship a feature.
+
+### 13.4 Execution order and phase gates (do these in sequence)
+
+**Priority key:** **P0** blocks unsafe exposure or irreversible damage; **P1** essential, measurable system functionality; **P2** valuable enhancements after prerequisites; **P3** exploration/parking lot. P0 is never deferred for the sake of a month label.
+
+#### Now: first 14 days — Milestone 1, Trustworthy RAG
+
+1. **P0 — Contain unsafe demo access.** In any public/reachable environment, block anonymous `admin` and cross-partition retrieval; do not expose confidential/real data. Prefer disabling/restricting the public `/chat` until a fixed-scope synthetic demonstration is safe. Add deny-path tests that prove a body `tenant_id`, a reused session ID, or a UI change cannot bypass the boundary. **This is containment, not completed multi-tenant authentication.**
+2. **P1 — Verify evaluation plumbing in the real checkout.** Parse every golden JSONL line; reconcile runner/readme environment variables only after checking them; make test sessions independent; surface exit status and error detail. Existing assessments of golden JSONL validity conflict, so establish ground truth with a test rather than assuming a specific defect.
+3. **P1 — Write a one-page use-case contract** for a property-manager maintenance/policy inquiry, with actors, scoped data, expected responses, refusal/escalation, manual alternative, and measurable acceptance criteria (`docs/use_case.md` **proposed**).
+4. **P1 — Prepare synthetic domain fixtures.** Start with roughly 10–20 fictional German-language building rules, lease extracts, maintenance SOPs and contractor policies, version/effective-date metadata, deliberate ambiguities, and at least two isolation partitions. Keep source provenance and expected IDs. Do not ingest K2 or customer documents into an unrestricted demo.
+5. **P1 — Expand to ~60–100 labeled eval cases** (a planning target, not a fixed KPI). Include answerable/unanswerable cases, German/English, multi-turn follow-ups, correct/incorrect citations, outdated/contradictory documents, injection attempts, and denied/allowed scope. Each answerable case identifies expected evidence IDs and critical facts, not only keywords.
+6. **P1 — Publish a reproducible baseline.** Compare current RAG with a no-retrieval control on the same cases. Report Recall@k, grounded-answer accuracy, citation support, refusal correctness, cross-partition/security checks, p50/p95 latency, errors and measured token/cost where available. Document missing instrumentation honestly; classify failures and choose the next *one* high-impact improvement.
+
+**First sprint gate:** a documented business scenario, valid versioned fixtures, an evaluation command that runs repeatably, a baseline scorecard with denominators and limitations, and **no public anonymous access to another partition's documents**. If P0 is still open, do not publish a live demo.
+
+#### Month 1 — November 21 to December 20, 2026: benchmark and problem framing
+
+- Complete the sprint gate; keep model-quality checks separate from deterministic CI tests.
+- Categorize failures (retrieval miss, stale evidence, unsupported synthesis, citation, refusal, language, unauthorized access, infrastructure).
+- Measure repeated-trial variance and publish a short prioritized failure backlog. Capture basic request IDs/usage if needed to measure latency and cost; avoid a full dashboard project yet.
+- **Evidence to publish:** `docs/use_case.md`, synthetic corpus, versioned `backend/evals/` dataset, baseline report and negative security tests.
+- **Exit gate:** you can show *what fails and why*, not just a screenshot of a plausible answer.
+
+#### Month 2 — December 21 to January 20, 2027: retrieval and document lifecycle
+
+- Improve the biggest measured retrieval weakness first. Compare existing semantic search + lexical rerank against a real hybrid/lexical index **only if justified**. Use identical evaluation cases for ablations.
+- Consider German/multilingual embeddings and rerankers; check dimension/latency/cost and plan full reindex if replacing the current 384-dimensional model.
+- Add scoped document category, version/effective-date and property metadata; preserve secure boundaries and existing ingestion contracts.
+- Verify S3 overwrite, supersession, deletion, duplicate event and DLQ behavior; expand to one high-value input format (PDF or structured export) **only if needed for the use case**.
+- **Evidence to publish:** before/after benchmark with tradeoffs, deterministic lifecycle tests, and one architecture decision record (ADR).
+- **Exit gate:** measurable improvement on a real failure mode without introducing access regressions or uncontrolled cost.
+
+#### Month 3 — January 21 to February 20, 2027: full identity, security and integration contract
+
+- Implement server-verified identity and roles (renter/property manager/admin), scope claims, session ownership and scoped retrieval; remove `admin`/untrusted partition selection from public UX. Select OIDC/provider with owner approval (§13.5).
+- Apply authorization to every record/document access path; test cross-partition, cross-property, cross-role and session ID guessing. Threat-model prompt injection and data exfiltration; establish GDPR-aware redaction and retention decisions.
+- Implement an OpenAPI/Pydantic contract plus a **simulated** property-management integration or fixture-backed ETL sync for typed property/renter/ticket records. Start with read-only operations.
+- **Evidence to publish:** runnable permission test matrix, threat model, typed integration sample and security/identity ADR.
+- **Exit gate:** a verified principal cannot reach out-of-scope session, document, record or admin data; no model-generated permission decision.
+
+#### Month 4 — February 21 to March 20, 2027: one controlled action workflow
+
+- Classify information/lookup/action requests; perform scoped RAG and record lookups; produce a **typed maintenance-case draft** with sources and uncertainty.
+- Add persistent approval state and a separate authorized property-manager review/approve endpoint/UI; submit to a simulated ticket API with idempotency and append-only audit.
+- Test a full happy path **and** wrong scope, hallucinated fields, rejection, crash/retry, duplicated events and external API failure. Evaluate end-to-end task completion and escalation correctness, not tool-call count.
+- Use workflow orchestration (e.g., LangGraph) only for a measured need for branching, recovery or state. MCP is optional after a reliable API exists; neither is required without a concrete technical need.
+- **Evidence to publish:** scripted case-demo, approval/audit record, failure recovery tests, stakeholder discovery notes and acceptance checklist.
+- **Exit gate:** every external write is human-approved, authorized, idempotent and auditable.
+
+#### Month 5 — March 21 to April 20, 2027: production-oriented LLMOps
+
+- Expand minimal instrumentation into redacted end-to-end tracing, quality monitoring, error/latency/cost dashboards, alerting and request-level cost attribution.
+- Run reproducible CI/staging smoke tests and load/failure tests; review timeouts, queue backlog, rate limiting, cold start and provider outages. Provide rollback and incident runbooks.
+- Document SLOs, budget constraints and EUR per **successful workflow**, not just token counts. Explain the boundary between a production-oriented demonstration and a real customer production service.
+- **Evidence to publish:** sanitized traces, reproducible staging deployment, cost and latency report, operational dashboard and runbook.
+- **Exit gate:** another engineer could reproduce, observe and safely operate the demonstration.
+
+#### Month 6 — April 21 to May 20, 2027: release validation, documentation and handover
+
+- Produce an accessible **synthetic-data** demo, 3–5 minute walkthrough and one prominent end-to-end story. Do not publish real customer information or unsafe endpoints.
+- Write a case study: business issue -> constraints -> baseline -> design tradeoffs -> implementation -> measured result -> access/safety limitations -> rollout/handover.
+- Update README architecture, local/demo instructions and ADRs; publish evaluation comparison, measured cost/latency, and incident/security notes without cherry-picking.
+- Run an end-to-end acceptance review with property-manager scenarios; document residual risks, non-goals, rollback considerations, data limitations and next operational improvements.
+- **Evidence to publish:** complete README, architecture diagram, demo walkthrough, technical case study, acceptance test results and reproducible scripts.
+- **Exit gate:** a reviewer can reproduce one user journey, read honest evidence, and understand what you built, why, how safe it is and what you would improve.
+
+### 13.5 Open architecture decisions — ask the owner when the decision becomes blocking
+
+Propose two or three options with tradeoffs (business need, security, cost, operational complexity and measurable benefit), then request a choice. **Do not stop smaller independent work while waiting** for a later milestone's choice.
+
+- What code-level `tenant_id` partitions represent, and mappings among organization, portfolio, property and renter identifiers (§13.1).
+- Identity provider/token format, role and scope model (e.g., Cognito + gateway JWT vs alternative OIDC).
+- Source of truth for property/renter/ticket records, simulated integration boundary, sync vs live read, and permissible data licensing.
+- Ticket API and approval UI/UX, idempotency store, and scope of the append-only audit log.
+- Guardrail approach: application checks, Bedrock Guardrails, or combinations, tied to concrete eval failures.
+- German/multilingual embedding/rerank model and associated full-reindex/migration approach.
+- Tracing/monitoring stack (CloudWatch/OpenTelemetry/Langfuse or others), expected budgets and granularity of cost attribution.
+- Retention, deletion and GDPR/DSGVO constraints for conversation, evidence and audit data before use of personal information.
+
+### 13.6 Prioritization and anti-scope-creep filter
+
+For each proposed issue/PR, answer in 3–6 lines:
+
+1. **Business:** Which step of the maintenance/policy workflow fails or costs time today?
+2. **System value:** Which capability, reliability property or integration requirement does this change improve (e.g., retrieval accuracy, isolation, latency, cost, workflow completion, maintainability)?
+3. **Measurement:** What dataset/test/metric/artifact will prove it worked, including a baseline or negative test?
+4. **Sequence:** Is it in the current month? Is it required by a blocked milestone? Does it satisfy a phase exit gate?
+5. **Risk and scope:** What privacy/security, cost or migration risks arise? What simpler approach would suffice?
+
+**Prefer:** improving an evaluated outcome, securing a real access boundary, shipping one typed integration, documenting tradeoffs and failure behavior, or making a demo reproducible.
+
+**Park by default:** autonomous multi-agent swarms, framework migrations for novelty, full platform redesign, Kubernetes, multi-cloud, fine-tuning, model training, graph RAG, a new vector store without measured need, fancy digital-twin UI, and broad document format support. Reopen only with an owner-approved requirement, measured problem or documented operational need. Do not refactor working infrastructure for novelty.
+
+### 13.7 Definition of done and engineering deliverables
+
+**Every meaningful task/PR:** states the business failure and acceptance checks, touches the minimal owners, preserves the documented HTTP/storage contracts, adds deterministic tests (including negative security cases when applicable), runs the relevant checks from §6, and reports measured improvement plus caveats. Record unsuccessful tests explicitly. For architectural changes, capture a short ADR: context, options, choice, rejected alternatives, effect on quality/latency/cost/security.
+
+Suggested future documentation paths **(create when relevant; they are not assumed to exist):**
+
+| Proof artifact | Suggested path | What it should show |
+| --- | --- | --- |
+| Customer problem, actors, acceptance criteria | `docs/use_case.md` | Workflow scope, stakeholders and measurable value |
+| Synthetic data, labeled questions, eval code | `backend/evals/` | Reproducible model and retrieval evaluation |
+| Baseline and ablation report | `reports/eval-baseline.md`, `reports/eval-comparison.md` | Honest retrieval/grounding/latency/cost evidence |
+| Design tradeoffs | `docs/adr/` | Architecture reasoning and decisions |
+| Threat model, test matrix | `docs/security/` | Real identity, scope and abuse controls |
+| Workflow walkthrough and audit example | `docs/demo/` | Controlled enterprise integration and human approval |
+| Runbook and SLOs | `docs/runbook.md` | Operational competence and handover |
+| Technical case study | `docs/case-study.md` | Business requirements -> architecture -> measurable outcome |
+| Dated priorities and changes | `docs/project-roadmap.md` (if committed) | Engineering alignment and scope control |
+
+Do not use percentages or efficiency claims without a reproducible dataset, denominator, method and timestamp. Suggested targets (e.g., Recall@5 90%, citation correctness 95%, refusal 95%) are **aspirational gates to consider only after baseline**, not achieved numbers. For authorization tests, the expected outcome is **zero successful unauthorized reads/writes**; a passing mock-only test is not proof of deployed security.
+
+### 13.8 Monthly roadmap review and maintenance
+
+At the start of each month through May 2027, review completed milestones, evaluation results, security findings, operational issues and feedback from representative property-management workflows. Compare outcomes with the phase exit gates and business acceptance criteria. Propose **at most two** priority changes for the next month, preserving the core property-operations use case unless an owner-approved requirement justifies changing direction.
+
+- Track each milestone as `not started` / `in progress` / `verified done` / `blocked`, with link to the relevant PR, test run, evaluation report or demo. Do not auto-mark as done because a calendar date passed.
+- Date material changes; capture the problem or feedback, supporting evidence, decision, impact on month priorities and who approved. The roadmap may change; code contracts change only when code/tests change.
+- External reviews or planning notes may provide recommendations; **they do not edit the repository automatically**. If the owner wants a durable log, maintain `docs/project-roadmap.md` in Git alongside this file.
+- Keep the **next task singular and concrete**; after each completed PR, name exactly the next highest-priority unfinished item and why it passes §13.6.
+
+**Roadmap decision log (planning only):**
+
+| Date | Decision | Reason | Status |
+| --- | --- | --- | --- |
+| 2026-11-22 | Prioritize public-demo containment and measured RAG evaluation before agents, full ticketing or infrastructure rewrites | Immediate data-access risk; measured quality and security are prerequisites for further features | Active plan; implementation not verified |
