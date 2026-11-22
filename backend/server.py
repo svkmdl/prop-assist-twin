@@ -1,13 +1,13 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 import os
 import logging
 import re
 import hmac
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Tuple
+from typing import Annotated, Optional, List, Dict, Tuple
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -118,6 +118,12 @@ logger = logging.getLogger(__name__)
 if USE_S3:
     s3_client = boto3.client("s3")
 
+def check_allowed_tenant(v: str) -> str:
+    """Shared allowlist check so /chat and /ingest reject unknown tenants alike (422)."""
+    if v not in config.ALLOWED_TENANT_IDS:
+        raise ValueError(f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}")
+    return v
+
 # Request/Response models
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
@@ -134,11 +140,7 @@ class ChatRequest(BaseModel):
     @field_validator("tenant_id")
     @classmethod
     def validate_tenant_id(cls, v: str) -> str:
-        if v not in config.ALLOWED_TENANT_IDS:
-            raise ValueError(
-                f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}"
-            )
-        return v
+        return check_allowed_tenant(v)
 
 class ChatResponse(BaseModel):
     response: str
@@ -642,16 +644,19 @@ async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
 async def ingest_file(
-    file: UploadFile = File(...),
-    tenant_id: str = Form(..., pattern=TENANT_ID_PATTERN),
+    file: Annotated[UploadFile, File()],
+    tenant_id: Annotated[
+        str, Form(pattern=TENANT_ID_PATTERN), AfterValidator(check_allowed_tenant)
+    ],
 ):
     # Without tenant_id metadata a vector is unreachable for tenant-filtered
     # retrieval, so the tenant is required and checked against the allowlist.
-    if tenant_id not in config.ALLOWED_TENANT_IDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}",
-        )
+    #
+    # TRUST MODEL: the target partition is chosen by the operator calling this
+    # local-only, admin-gated route (like the S3 folder for the worker). It is
+    # NOT a pattern for user-facing paths: with LOCAL_DEV=true and no
+    # ADMIN_API_KEY it is plain request input. Production scope must come from
+    # server-verified identity claims (CLAUDE.md §9.1, §9.4, §13.3.1).
 
     filename = Path(file.filename or "").name
     if not SAFE_FILENAME_PATTERN.fullmatch(filename):

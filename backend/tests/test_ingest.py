@@ -161,7 +161,9 @@ class TestIngestTenant:
             data={"tenant_id": "T999"},
             files={"file": ("notes.md", b"# hi", "text/markdown")},
         )
-        assert resp.status_code == 400
+        # Same status as /chat's ChatRequest for an unknown tenant.
+        assert resp.status_code == 422
+        assert "tenant_id must be one of" in resp.text
         assert indexed == []
 
     def test_same_filename_for_two_tenants_gets_distinct_vector_ids(
