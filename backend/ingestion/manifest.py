@@ -3,8 +3,13 @@
 Tracks ingestion status per source document version to provide idempotency and
 operational visibility. Table schema:
 
-    PK (tenant_id):  S
+    PK (scope_key):  S   ->  "{audience}/{scope}[/{id}]", e.g. "renters/leases/L-0001"
+                             (``DocumentKey.scope_key``, ADR 0002)
     SK (source_sk):  S   ->  "{source_key}#{source_version_or_sha256}"
+
+``scope_key`` replaced the former ``tenant_id`` partition key: documents are now
+scoped to company / property / lease, not to a tenant. Changing a DynamoDB key
+schema replaces the table, so existing manifest rows are not migrated.
 """
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -45,11 +50,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_record(tenant_id: str, source_sk: str) -> Optional[Dict[str, Any]]:
+def get_record(scope_key: str, source_sk: str) -> Optional[Dict[str, Any]]:
     """Return the deserialized manifest item, or ``None`` if absent."""
     response = _client().get_item(
         TableName=config.MANIFEST_TABLE,
-        Key={"tenant_id": {"S": tenant_id}, "source_sk": {"S": source_sk}},
+        Key={"scope_key": {"S": scope_key}, "source_sk": {"S": source_sk}},
         ConsistentRead=True,
     )
     item = response.get("Item")
@@ -58,14 +63,14 @@ def get_record(tenant_id: str, source_sk: str) -> Optional[Dict[str, Any]]:
     return _deserialize(item)
 
 
-def list_versions(tenant_id: str, source_key: str) -> List[Dict[str, Any]]:
+def list_versions(scope_key: str, source_key: str) -> List[Dict[str, Any]]:
     """Return all manifest records (every version) for one source key."""
     prefix = f"{source_key}#"
     records: List[Dict[str, Any]] = []
     kwargs: Dict[str, Any] = {
         "TableName": config.MANIFEST_TABLE,
-        "KeyConditionExpression": "tenant_id = :t AND begins_with(source_sk, :p)",
-        "ExpressionAttributeValues": {":t": {"S": tenant_id}, ":p": {"S": prefix}},
+        "KeyConditionExpression": "scope_key = :t AND begins_with(source_sk, :p)",
+        "ExpressionAttributeValues": {":t": {"S": scope_key}, ":p": {"S": prefix}},
         "ConsistentRead": True,
     }
     while True:
@@ -84,7 +89,7 @@ def list_versions(tenant_id: str, source_key: str) -> List[Dict[str, Any]]:
 
 def put_status(
     *,
-    tenant_id: str,
+    scope_key: str,
     source_sk: str,
     status: str,
     source_bucket: str,
@@ -99,11 +104,11 @@ def put_status(
 ) -> None:
     """Create or overwrite the manifest record with the given status."""
     now = _now_iso()
-    existing = get_record(tenant_id, source_sk)
+    existing = get_record(scope_key, source_sk)
     created_at = existing.get("created_at") if existing else now
 
     item: Dict[str, Any] = {
-        "tenant_id": tenant_id,
+        "scope_key": scope_key,
         "source_sk": source_sk,
         "source_bucket": source_bucket,
         "source_key": source_key,
@@ -123,18 +128,18 @@ def put_status(
     _client().put_item(TableName=config.MANIFEST_TABLE, Item=_serialize(item))
 
 
-def mark_deleted(*, tenant_id: str, source_sk: str) -> None:
+def mark_deleted(*, scope_key: str, source_sk: str) -> None:
     """Flip an existing manifest record to ``DELETED``, preserving its history."""
-    mark_status(tenant_id=tenant_id, source_sk=source_sk, status=DELETED)
+    mark_status(scope_key=scope_key, source_sk=source_sk, status=DELETED)
 
 
-def mark_status(*, tenant_id: str, source_sk: str, status: str) -> None:
+def mark_status(*, scope_key: str, source_sk: str, status: str) -> None:
     """Change the status of an existing manifest record, preserving its fields."""
-    existing = get_record(tenant_id, source_sk)
+    existing = get_record(scope_key, source_sk)
     if not existing:
         return
     put_status(
-        tenant_id=tenant_id,
+        scope_key=scope_key,
         source_sk=source_sk,
         status=status,
         source_bucket=existing.get("source_bucket", ""),

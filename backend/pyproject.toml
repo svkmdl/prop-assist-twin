@@ -18,6 +18,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 norecursedirs = ["lambda-package", ".venv", ".git"]
 addopts = "--cov=server --cov=common --cov=ingestion --cov-report=term-missing"
 

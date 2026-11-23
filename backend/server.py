@@ -1,22 +1,37 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import AfterValidator, BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 import os
 import logging
 import re
 import hmac
-from pathlib import Path
 from dotenv import load_dotenv
 from typing import Annotated, Optional, List, Dict, Tuple
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from common import chunking, embeddings, vector_store, config
+from common.access import (
+    Scope,
+    StaticScopeResolver,
+    UnknownPrincipalError,
+    build_vector_filter,
+    is_authorized,
+)
+from common.doc_keys import (
+    DocumentFormatError,
+    InvalidDocumentKeyError,
+    build_vector_id,
+    parse_document_key,
+)
 from common.models import SourceItem
+from common.prepare import build_chunk_metadata, prepare_document
+from common.registry import Registry, RegistryError, load_registry
 from context import prompt, rewrite_prompt
 
 # Load environment variables
@@ -106,8 +121,6 @@ TENANT_ID_PATTERN = r"^[A-Za-z0-9_-]{1,32}$"
 
 # Ingestion file configuration
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "1048576"))
-_ext_alts = "|".join(re.escape(s.lstrip(".")) for s in sorted(config.SUPPORTED_SUFFIXES))
-SAFE_FILENAME_PATTERN = re.compile(rf"^[A-Za-z0-9._-]+\.(?:{_ext_alts})$")
 INGESTION_MAX_WORKERS = max(1, min(8, int(os.getenv("INGESTION_MAX_WORKERS", "4"))))
 
 # Set up logging
@@ -118,11 +131,52 @@ logger = logging.getLogger(__name__)
 if USE_S3:
     s3_client = boto3.client("s3")
 
-def check_allowed_tenant(v: str) -> str:
-    """Shared allowlist check so /chat and /ingest reject unknown tenants alike (422)."""
-    if v not in config.ALLOWED_TENANT_IDS:
-        raise ValueError(f"tenant_id must be one of {config.ALLOWED_TENANT_IDS}")
-    return v
+# Who may see which documents (ADR 0002): the synthetic registry maps tenants to
+# leases and properties. It ships in the Lambda ZIP with data/. An unusable file
+# must not crash the API: the registry then stays empty and every chat request is
+# refused (fail closed), visible in the log and in /health.
+REGISTRY_PATH = Path(os.getenv("REGISTRY_PATH") or Path(__file__).resolve().parent / "data" / "registry.json")
+_EMPTY_REGISTRY = Registry(
+    properties=frozenset(), lease_property={}, tenant_leases={}, staff=frozenset()
+)
+
+def _load_registry(path: Path) -> Registry:
+    try:
+        return load_registry(path)
+    except RegistryError as exc:
+        logger.error(
+            "Scope registry %s is unusable; every chat request will be refused: %s",
+            path, "; ".join(exc.problems),
+        )
+        return _EMPTY_REGISTRY
+
+REGISTRY: Registry = _load_registry(REGISTRY_PATH)
+SCOPE_RESOLVER = StaticScopeResolver(REGISTRY)
+
+def _is_known_principal(principal: str) -> bool:
+    return REGISTRY.is_staff(principal) or principal in REGISTRY.tenant_leases
+
+def _resolve_public_chat_tenant(raw: str) -> str:
+    """Validate the one tenant whose scope anonymous /chat callers receive.
+
+    Fails closed: it must be a registered *tenant* (never staff), otherwise
+    anonymous chat is disabled instead of widened.
+    """
+    value = raw.strip()
+    if not value:
+        return ""
+    if value not in REGISTRY.tenant_leases:
+        logger.error(
+            "PUBLIC_CHAT_TENANT_ID is not a registered tenant; anonymous chat stays disabled"
+        )
+        return ""
+    return value
+
+# P0 containment (docs/adr/0003): anonymous /chat callers are pinned to this
+# single, synthetic-only tenant, and receive exactly that tenant's scope (its own
+# leases, its properties and the company-wide documents; never staff documents).
+# Empty means anonymous chat is disabled.
+PUBLIC_CHAT_TENANT_ID = _resolve_public_chat_tenant(os.getenv("PUBLIC_CHAT_TENANT_ID", ""))
 
 # Request/Response models
 class ChatRequest(BaseModel):
@@ -132,15 +186,15 @@ class ChatRequest(BaseModel):
         pattern=SESSION_ID_PATTERN,
         max_length=64
     )
-    tenant_id: str = Field(
-        default=config.DEFAULT_TENANT_ID,
+    # Optional on purpose: the server, not the body, decides the effective scope
+    # (see resolve_chat_scope). An omitted value must never mean "admin" for an
+    # anonymous caller. Only the *shape* is validated here; whether the tenant
+    # exists is decided after privilege is known, so an anonymous caller cannot
+    # tell registered tenants from unregistered ones (uniform 403).
+    tenant_id: Optional[str] = Field(
+        default=None,
         pattern=TENANT_ID_PATTERN,
     )
-
-    @field_validator("tenant_id")
-    @classmethod
-    def validate_tenant_id(cls, v: str) -> str:
-        return check_allowed_tenant(v)
 
 class ChatResponse(BaseModel):
     response: str
@@ -225,8 +279,75 @@ def require_admin_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
             logger.warning("ADMIN_API_KEY is not configured; admin endpoint is open because LOCAL_DEV=true")
             return
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin API key not configured")
-    if not x_api_key or not hmac.compare_digest(x_api_key, ADMIN_API_KEY):
+    if not _admin_key_matches(x_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+
+def _admin_key_matches(x_api_key: Optional[str]) -> bool:
+    """Constant-time key check. Bytes keep non-ASCII input from raising TypeError."""
+    if not x_api_key or not ADMIN_API_KEY:
+        return False
+    return hmac.compare_digest(x_api_key.encode("utf-8"), ADMIN_API_KEY.encode("utf-8"))
+
+def is_privileged_chat_caller(x_api_key: Optional[str]) -> bool:
+    """Whether /chat may honour a caller-chosen tenant scope (including ``admin``).
+
+    - ``ADMIN_API_KEY`` unset: only ``LOCAL_DEV=true`` is privileged; a header is ignored.
+    - ``ADMIN_API_KEY`` set: only a matching ``x-api-key``. A supplied but wrong key is
+      a 401 (not a silent downgrade); an absent key is an anonymous caller.
+    """
+    if not ADMIN_API_KEY:
+        return LOCAL_DEV
+    if not x_api_key:
+        return False
+    if not _admin_key_matches(x_api_key):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+    return True
+
+def resolve_chat_scope(
+    requested: Optional[str], stored: Optional[str], privileged: bool
+) -> Tuple[str, Scope]:
+    """Server-side scope decision for /chat. The request body never grants scope.
+
+    Returns ``(principal, scope)``. Anonymous callers only ever get the scope of
+    ``PUBLIC_CHAT_TENANT_ID``; asking for any other tenant (registered or not),
+    or reusing a session bound to another tenant, is refused with the same 403
+    before any retrieval or model call, so the response does not reveal which
+    tenants exist. Privileged callers (admin key, or LOCAL_DEV without a key) may
+    choose a registered principal, including a staff one; an existing session's
+    stored principal wins over the request.
+    """
+    denied = HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access to the requested scope is not permitted",
+    )
+    if privileged:
+        if stored is not None:
+            principal = stored
+        else:
+            principal = requested or config.DEFAULT_TENANT_ID
+            if requested is not None and not _is_known_principal(requested):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Unknown tenant_id",
+                )
+    else:
+        if not PUBLIC_CHAT_TENANT_ID:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Chat is not available",
+            )
+        for value in (requested, stored):
+            if value is not None and value != PUBLIC_CHAT_TENANT_ID:
+                # Same message for request and session mismatches: no oracle for
+                # which sessions or tenants exist.
+                raise denied
+        principal = PUBLIC_CHAT_TENANT_ID
+
+    try:
+        return principal, SCOPE_RESOLVER.resolve(principal)
+    except UnknownPrincipalError:
+        # e.g. a stored session whose tenant was removed from the registry
+        raise denied from None
 
 def call_bedrock(
         conversation: List[Dict],
@@ -301,23 +422,23 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
 def _document_group_key(metadata: Dict) -> str:
     """Return an internal identifier used to group chunks by source document.
 
-    ``/ingest`` vectors carry ``source_path``; ingestion-worker vectors carry only
-    ``source_key`` (the S3 object key). Grouping on ``title`` alone would merge
-    same-named documents from different folders/tenants. ``source_key`` is used
-    for grouping only and is never returned to clients or put in the prompt,
-    because it exposes the internal bucket layout and tenant folder names.
+    Vectors written under ADR 0002 carry ``source_key`` (the scope-qualified S3
+    key, unique per document *and business version*, so same-named documents in
+    different leases, properties or audiences stay distinct). ``source_key`` is
+    used for grouping only and is never returned to clients or put in the
+    prompt, because it exposes the internal bucket layout.
 
-    The tenant is part of the key so that same-named ``/ingest`` uploads for
-    different tenants stay distinct under unfiltered (admin) retrieval.
+    ``source_path`` and ``title`` remain as fallbacks. Vectors from before
+    ADR 0002 (``tenant_id`` metadata) never reach this function: they lack the
+    audience and effective-date fields, so the retrieval filter and the per-hit
+    check exclude them for every principal.
     """
-    path = (
+    return (
         metadata.get("source_path")
         or metadata.get("source_key")
         or metadata.get("title")
         or "unknown"
     )
-    tenant_id = metadata.get("tenant_id")
-    return f"{tenant_id}:{path}" if tenant_id else path
 
 
 def index_text_chunk(
@@ -462,36 +583,41 @@ def retrieve_sources(
         query: str,
         fetch_n: int = RAW_FETCH_SIZE,
         return_n: int = FINAL_TOP_K,
-        tenant_id: Optional[str] = None,
+        *,
+        scope: Scope,
 ) -> List[SourceItem]:
     """
         Retrieves sources using a two-stage process:
         1. Fetch a large candidate pool (fetch_n).
         2. Rerank by combined score and limit per-document chunks.
 
-        ``tenant_id`` scopes the vector search to a single tenant when provided
-        and not equal to the default admin value.  Pass *None* or the admin
-        tenant to query across all tenants.
+        ``scope`` is required and keyword-only: there is deliberately no way to
+        retrieve without one. It is enforced twice (ADR 0002): the S3 Vectors
+        metadata filter built from it keeps unauthorized vectors out of the
+        result, and every returned hit is re-checked in code; a hit outside the
+        scope is dropped and logged (without its content).
     """
 
     if not is_rag_enabled():
         logger.info("retrieval disabled")
         return []
 
-    # Build metadata filter only for non-admin tenants
-    metadata_filter: Optional[Dict] = (
-        {"tenant_id": {"$eq": tenant_id}}
-        if tenant_id and tenant_id != config.DEFAULT_TENANT_ID
-        else None
-    )
+    metadata_filter = build_vector_filter(scope)
 
     try:
         # The "Wide Net" fetch from Vector DB
-        raw_results = search_text_chunks(query, top_k=fetch_n, metadata_filter=metadata_filter)
-        logger.info(f"Vector DB returned {len(raw_results)} raw candidates.")
+        candidates = search_text_chunks(query, top_k=fetch_n, metadata_filter=metadata_filter)
+        logger.info(f"Vector DB returned {len(candidates)} raw candidates.")
     except Exception as exc:
         logger.error(f"Vector search failed: {exc}", exc_info=True)
         return []
+
+    raw_results = [hit for hit in candidates if is_authorized(hit.get("metadata"), scope)]
+    if len(raw_results) != len(candidates):
+        logger.warning(
+            "Dropped %d retrieved vector(s) outside the caller's scope (role=%s, principal=%s)",
+            len(candidates) - len(raw_results), scope.role, scope.principal,
+        )
 
     # Scoring and Reranking
     scored_items = []
@@ -544,7 +670,8 @@ def retrieve_sources(
             chunk_body = metadata.get("chunk_text", "")
             final_sources.append(
                 SourceItem(
-                    id=item.get("key") or str(uuid.uuid4()),
+                    id=f"S{len(final_sources) + 1}",
+                    vector_key=item.get("key"),
                     title=metadata.get("title"),
                     source_path=metadata.get("source_path"),
                     snippet=shorten_snippet(chunk_body),
@@ -636,32 +763,36 @@ async def health_check():
         "sagemaker_endpoint_configure" : bool(SAGEMAKER_ENDPOINT),
         "s3vectors_configured" : bool(VECTOR_BUCKET and VECTOR_INDEX),
         "rag_enabled": is_rag_enabled(),
-        "ingestion_api_enabled": LOCAL_DEV
+        "ingestion_api_enabled": LOCAL_DEV,
+        "public_chat_enabled": bool(PUBLIC_CHAT_TENANT_ID),
+        "registry_loaded": REGISTRY is not _EMPTY_REGISTRY,
     }
 
 @app.post("/embed", dependencies=[Depends(require_admin_api_key)])
 async def embed(request: EmbedRequest):
     return {"embedding": get_embedding(request.text)}
 
+# /ingest has no manifest, so every local upload uses this fixed source version:
+# re-uploading a key overwrites its own vector ids instead of piling up copies.
+LOCAL_INGEST_SOURCE_VERSION = "local"
+
 async def ingest_file(
     file: Annotated[UploadFile, File()],
-    tenant_id: Annotated[
-        str, Form(pattern=TENANT_ID_PATTERN), AfterValidator(check_allowed_tenant)
-    ],
+    source_key: Annotated[str, Form(max_length=300)],
 ):
-    # Without tenant_id metadata a vector is unreachable for tenant-filtered
-    # retrieval, so the tenant is required and checked against the allowlist.
+    # The target scope is the S3-style key, validated by the same grammar and the
+    # same preparation code as the event-driven worker (ADR 0002), so a document
+    # indexed here has exactly the metadata the worker would write.
     #
-    # TRUST MODEL: the target partition is chosen by the operator calling this
-    # local-only, admin-gated route (like the S3 folder for the worker). It is
-    # NOT a pattern for user-facing paths: with LOCAL_DEV=true and no
+    # TRUST MODEL: the scope (audience, company/property/lease) is chosen by the
+    # operator calling this local-only, admin-gated route, like the S3 key for the
+    # worker. It is NOT a pattern for user-facing paths: with LOCAL_DEV=true and no
     # ADMIN_API_KEY it is plain request input. Production scope must come from
     # server-verified identity claims (CLAUDE.md §9.1, §9.4, §13.3.1).
-
-    filename = Path(file.filename or "").name
-    if not SAFE_FILENAME_PATTERN.fullmatch(filename):
-        allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
-        raise HTTPException(status_code=400, detail=f"Unsupported file type; allowed: {allowed}")
+    try:
+        parse_document_key(source_key)
+    except InvalidDocumentKeyError as exc:
+        raise HTTPException(status_code=422, detail="; ".join(exc.problems))
 
     try:
         content_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
@@ -669,26 +800,29 @@ async def ingest_file(
             raise HTTPException(status_code=413, detail="File uploaded too large")
 
         try:
-            content = content_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="File must be UTF-8 text")
+            prepared = prepare_document(
+                source_key,
+                content_bytes,
+                max_bytes=MAX_UPLOAD_BYTES,
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
+            )
+        except DocumentFormatError as exc:
+            raise HTTPException(status_code=400, detail="; ".join(exc.problems))
 
+        ingested_at = datetime.now(timezone.utc).isoformat()
         futures = []
         with ThreadPoolExecutor(max_workers=INGESTION_MAX_WORKERS) as executor:
-            for count, chunk in enumerate(chunk_text(content)):
-
-                # Tenant-prefixed so the same filename uploaded for two tenants
-                # does not overwrite the other tenant's vectors.
-                vector_id = f"{tenant_id}/{filename}_{count}"
-
-                metadata = {
-                    "tenant_id": tenant_id,
-                    "source_path": f"api_upload/{filename}",
-                    "title": filename.rsplit('.', 1)[0],
-                    "doc_type": next(s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)),
-                    "chunk_index": count
-                }
-
+            for count, chunk in enumerate(prepared.chunks):
+                vector_id = build_vector_id(prepared.key, LOCAL_INGEST_SOURCE_VERSION, count)
+                metadata = build_chunk_metadata(
+                    prepared,
+                    chunk_index=count,
+                    chunk_text=chunk,
+                    source_version=LOCAL_INGEST_SOURCE_VERSION,
+                    embedding_model=config.EMBEDDING_MODEL,
+                    ingested_at=ingested_at,
+                )
                 futures.append(executor.submit(index_text_chunk, chunk, vector_id, metadata))
 
             chunks_processed = 0
@@ -697,7 +831,9 @@ async def ingest_file(
                 chunks_processed += 1
 
         return {
-            "filename": filename,
+            "source_key": source_key,
+            "doc_id": prepared.key.doc_id,
+            "doc_version": prepared.key.doc_version,
             "chunks_indexed": chunks_processed,
             "status": "success"
         }
@@ -714,25 +850,35 @@ if LOCAL_DEV:
     app.post("/ingest", dependencies=[Depends(require_admin_api_key)])(ingest_file)
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, x_api_key: Optional[str] = Header(default=None)):
     try:
+        # Decide privilege first: a wrong key must fail before any session I/O.
+        privileged = is_privileged_chat_caller(x_api_key)
+
         # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
 
         # Load conversation history; resolve effective tenant from stored session
         stored_tenant_id, conversation = load_conversation(session_id)
-        # For a new session use the request's tenant; for an existing session
-        # always honour the tenant that was stored at creation time to prevent
-        # mid-session tenant switching.
-        effective_tenant_id = (
-            stored_tenant_id if stored_tenant_id is not None else request.tenant_id
+        # The server decides the scope (P0 containment). An existing session's
+        # stored tenant is never widened; anonymous callers are pinned to
+        # PUBLIC_CHAT_TENANT_ID and refused otherwise, before retrieval or Bedrock.
+        effective_tenant_id, scope = resolve_chat_scope(
+            request.tenant_id, stored_tenant_id, privileged
         )
+        if not privileged and stored_tenant_id is None and conversation:
+            # A legacy list-format session has no tenant binding; its history may come
+            # from another scope (e.g. admin) and must not become model context here.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access to the requested scope is not permitted",
+            )
 
         # Determine the search query (using history if it exists)
         search_query = rewrite_query(conversation, request.message)
 
         # Retrieve sources scoped to the effective tenant
-        sources = retrieve_sources(search_query, tenant_id=effective_tenant_id)
+        sources = retrieve_sources(search_query, scope=scope)
 
         # Call Bedrock for response
         assistant_response = call_bedrock(

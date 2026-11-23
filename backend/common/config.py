@@ -41,6 +41,7 @@ RAG_DOCS_BUCKET = os.getenv("RAG_DOCS_BUCKET", "")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Tenant configuration
-ALLOWED_TENANT_IDS = ["T001", "T002", "admin"]
+# Principal a privileged /chat caller gets when it names none. Which principals
+# exist (tenants with their leases, and staff) is data in data/registry.json,
+# loaded by common.registry; the former ALLOWED_TENANT_IDS list is gone.
 DEFAULT_TENANT_ID = "admin"

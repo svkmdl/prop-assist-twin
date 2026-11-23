@@ -325,6 +325,7 @@ resource "aws_lambda_function" "api" {
       CHUNK_SIZE             = tostring(var.chunk_size)
       CHUNK_OVERLAP          = tostring(var.chunk_overlap)
       ADMIN_API_KEY          = var.admin_api_key
+      PUBLIC_CHAT_TENANT_ID  = var.public_chat_tenant_id
       MAX_MESSAGE_CHARS      = tostring(var.max_message_chars)
       MAX_UPLOAD_BYTES       = tostring(var.max_upload_bytes)
       INGESTION_MAX_WORKERS  = tostring(var.ingestion_max_workers)

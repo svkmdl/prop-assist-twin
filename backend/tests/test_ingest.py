@@ -1,8 +1,9 @@
 """
-Request validation and /ingest abuse tests.
+Local-only /ingest tests (ADR 0002).
 
-Covers /ingest filename validation, upload size limit, UTF-8 enforcement, the
-happy-path metadata shape, and ChatRequest field validation.
+/ingest takes a ``source_key`` in the same grammar as the S3 keys of the event-driven
+worker and runs the same preparation code, so a document indexed here carries exactly
+the metadata the worker would write. Also covers ChatRequest field validation.
 
 The default `client` fixture runs with LOCAL_DEV=true, so the admin gate on
 /ingest is open and these tests exercise the validation logic directly.
@@ -10,186 +11,171 @@ The default `client` fixture runs with LOCAL_DEV=true, so the admin gate on
 import pytest
 from fastapi import HTTPException
 
+KEY = "incoming/renters/company/policies/repair-policy/v1.md"
+LEASE_KEY = "incoming/renters/leases/L-0001/contracts/lease-contract/v2.md"
+
+
+def doc(body="Reparaturen bitte schriftlich melden.", title="Reparaturrichtlinie",
+        frm="2027-01-01", to=None, language="de", extra=""):
+    lines = ["---", f"title: {title}", f"language: {language}", f"effective_from: {frm}"]
+    if to:
+        lines.append(f"effective_to: {to}")
+    if extra:
+        lines.append(extra)
+    return ("\n".join(lines) + f"\n---\n{body}\n").encode("utf-8")
+
+
+def post(client, source_key=KEY, content=None, filename="upload.md"):
+    return client.post(
+        "/ingest",
+        data={"source_key": source_key},
+        files={"file": (filename, doc() if content is None else content, "text/markdown")},
+    )
+
+
+@pytest.fixture
+def indexed(server_module, monkeypatch):
+    """Capture what /ingest would write to the vector index."""
+    calls = {}
+
+    def fake_index(text, vector_id, metadata):
+        calls[vector_id] = (text, metadata)
+        return vector_id
+
+    monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
+    return calls
+
 
 class TestIngestValidation:
     @pytest.mark.parametrize(
-        "filename",
-        ["notes.txt", "notes.md.exe", "weird name.md", "archive.tar.gz"],
+        "source_key,fragment",
+        [
+            ("incoming/T001/faq.md", "unknown audience/scope"),  # the former layout
+            ("incoming/renters/company/policies/repair-policy/latest.md", "filename must be"),
+            ("incoming/renters/company/policies/repair-policy/v1.txt", "filename must be"),
+            ("incoming/renters/company/faq/repair-policy/v1.md", "unknown doc_type"),
+            ("incoming/renters/leases/L-1/contracts/x/v1.md", "invalid lease_id"),
+            ("incoming/staff/leases/L-0001/contracts/x/v1.md", "unknown audience/scope"),
+            ("../../etc/passwd", "start with incoming/"),
+            ("notes.md", "start with incoming/"),
+        ],
     )
-    def test_rejects_unsafe_filename(self, client, filename):
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={"file": (filename, b"# hi", "text/markdown")},
-        )
-        assert resp.status_code == 400
-
-    def test_rejects_oversize_upload(self, client, server_module, monkeypatch):
-        monkeypatch.setattr(server_module, "MAX_UPLOAD_BYTES", 10)
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={"file": ("big.md", b"a" * 50, "text/markdown")},
-        )
-        assert resp.status_code == 413
-
-    def test_rejects_non_utf8(self, client):
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={"file": ("bad.md", b"\xff\xfe\x00bad", "text/markdown")},
-        )
-        assert resp.status_code == 400
-
-    def test_happy_path_indexes_chunks_with_metadata(
-        self, client, server_module, monkeypatch
+    def test_rejects_keys_outside_the_grammar_before_reading_or_indexing(
+        self, client, indexed, source_key, fragment
     ):
-        indexed = []
+        resp = post(client, source_key)
+        assert resp.status_code == 422
+        assert fragment in resp.json()["detail"]
+        assert indexed == {}
 
-        monkeypatch.setattr(
-            server_module,
-            "chunk_text",
-            lambda content: iter(["first chunk", "second chunk", "third chunk"]),
-        )
+    def test_missing_source_key_rejected(self, client, indexed):
+        resp = client.post("/ingest", files={"file": ("n.md", doc(), "text/markdown")})
+        assert resp.status_code == 422 and indexed == {}
 
-        def fake_index(text, vector_id, metadata):
-            indexed.append((text, vector_id, metadata))
-            return vector_id
+    def test_overlong_source_key_rejected(self, client, indexed):
+        assert post(client, "incoming/" + "x" * 400).status_code == 422
+        assert indexed == {}
 
-        monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
+    def test_the_upload_filename_is_irrelevant(self, client, indexed):
+        """Only source_key decides the target; a hostile filename cannot move the document."""
+        assert post(client, KEY, filename="../../evil.exe").status_code == 200
+        assert {vid.split("/v1/")[0] for vid in indexed} == {"renters/company/policies/repair-policy"}
 
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={
-                "file": ("notes.md", b"# Title\n\nSome content here.", "text/markdown")
-            },
-        )
+    def test_rejects_oversize_upload(self, client, server_module, monkeypatch, indexed):
+        monkeypatch.setattr(server_module, "MAX_UPLOAD_BYTES", 10)
+        assert post(client, content=b"a" * 50).status_code == 413
+        assert indexed == {}
+
+    @pytest.mark.parametrize(
+        "content,fragment",
+        [
+            (b"\xff\xfe\x00bad", "not valid UTF-8"),
+            (b"", "file is empty"),
+            (b"# no front matter\n\nbody", "front-matter"),
+            (doc(language="fr"), "language must be one of"),
+            (doc(extra="colour: blue"), "unknown key 'colour'"),
+            (doc(frm="2027-06-01", to="2027-01-01"), "effective_to must not be before"),
+            (doc(body="  "), "no content"),
+        ],
+    )
+    def test_rejects_invalid_content_with_every_reason(self, client, indexed, content, fragment):
+        resp = post(client, content=content)
+        assert resp.status_code == 400
+        assert fragment in resp.json()["detail"]
+        assert indexed == {}
+
+    def test_happy_path_indexes_chunks_with_worker_identical_metadata(self, client, indexed):
+        long_body = "\n\n".join(f"Absatz {i}. " + "Wort " * 300 for i in range(4))
+
+        resp = post(client, LEASE_KEY, doc(body=long_body, to="2027-12-31"))
 
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "success"
-        assert body["filename"] == "notes.md"
-        assert body["chunks_indexed"] == len(indexed) >= 1
+        assert body["source_key"] == LEASE_KEY
+        assert (body["doc_id"], body["doc_version"]) == ("lease-contract", 2)
+        assert body["chunks_indexed"] == len(indexed) >= 2
 
-        indexed_by_id = {vector_id: (text, metadata) for text, vector_id, metadata in indexed}
-        assert set(indexed_by_id) == {"T001/notes.md_0", "T001/notes.md_1", "T001/notes.md_2"}
+        assert set(indexed) == {
+            f"renters/leases/L-0001/contracts/lease-contract/v2/local/{i}" for i in range(len(indexed))
+        }
+        text, metadata = indexed["renters/leases/L-0001/contracts/lease-contract/v2/local/0"]
+        assert text == metadata["chunk_text"] and "effective_from" not in text
+        # Exactly the worker's key set, minus source_bucket (the local route has no bucket).
+        assert set(metadata) == {
+            "audience", "scope_type", "lease_id", "doc_type", "doc_id", "doc_version",
+            "language", "effective_from", "effective_to", "title", "source_key",
+            "chunk_index", "chunk_text", "source_version", "embedding_model", "ingested_at",
+        }
+        assert metadata["audience"] == "renter" and metadata["scope_type"] == "lease"
+        assert metadata["lease_id"] == "L-0001" and "property_id" not in metadata
+        assert metadata["doc_type"] == "contracts" and metadata["doc_version"] == 2
+        assert (metadata["effective_from"], metadata["effective_to"]) == (20270101, 20271231)
+        assert metadata["source_version"] == "local" and metadata["source_key"] == LEASE_KEY
+        assert "tenant_id" not in metadata and "source_path" not in metadata
+        assert sorted(m["chunk_index"] for _, m in indexed.values()) == list(range(len(indexed)))
 
-        for chunk_index in range(3):
-            text, metadata = indexed_by_id[f"T001/notes.md_{chunk_index}"]
-            assert text == ["first chunk", "second chunk", "third chunk"][chunk_index]
-            assert metadata["title"] == "notes"
-            assert metadata["doc_type"] == ".md"
-            assert metadata["source_path"] == "api_upload/notes.md"
-            assert metadata["tenant_id"] == "T001"
-            assert metadata["chunk_index"] == chunk_index
+    def test_re_uploading_a_key_overwrites_its_own_vector_ids(self, client, indexed):
+        assert post(client).status_code == 200
+        first = set(indexed)
+        assert post(client, content=doc(body="Geänderter Text.")).status_code == 200
+        assert set(indexed) == first  # same deterministic ids, no pile-up of copies
+        assert "Geänderter Text." in next(iter(indexed.values()))[0]
+
+    def test_same_file_name_in_two_scopes_gets_distinct_vector_ids(self, client, indexed):
+        for key in (
+            "incoming/renters/leases/L-0001/contracts/lease-contract/v1.md",
+            "incoming/renters/leases/L-0002/contracts/lease-contract/v1.md",
+            "incoming/staff/company/policies/lease-contract/v1.md",
+        ):
+            assert post(client, key).status_code == 200
+        assert len(indexed) == 3
+
+    def test_business_versions_are_separate_documents(self, client, indexed):
+        v1 = "incoming/renters/company/policies/repair-policy/v1.md"
+        v2 = "incoming/renters/company/policies/repair-policy/v2.md"
+        assert post(client, v1, doc(to="2026-12-31", frm="2026-01-01")).status_code == 200
+        assert post(client, v2).status_code == 200
+        assert {m["doc_version"] for _, m in indexed.values()} == {1, 2}
+        assert len(indexed) == 2
 
     def test_worker_http_exception_propagates(self, client, server_module, monkeypatch):
-        monkeypatch.setattr(
-            server_module,
-            "chunk_text",
-            lambda content: iter(["first chunk", "second chunk"]),
-        )
-
         def fake_index(text, vector_id, metadata):
-            if vector_id == "T001/notes.md_1":
-                raise HTTPException(status_code=503, detail="vector store unavailable")
-            return vector_id
+            raise HTTPException(status_code=503, detail="vector store unavailable")
 
         monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
-
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={"file": ("notes.md", b"# Title", "text/markdown")},
-        )
-
+        resp = post(client)
         assert resp.status_code == 503
         assert resp.json()["detail"] == "vector store unavailable"
 
     def test_worker_generic_exception_returns_500(self, client, server_module, monkeypatch):
-        monkeypatch.setattr(
-            server_module,
-            "chunk_text",
-            lambda content: iter(["first chunk", "second chunk"]),
-        )
-
         def fake_index(text, vector_id, metadata):
-            if vector_id == "T001/notes.md_1":
-                raise RuntimeError("indexing failed")
-            return vector_id
+            raise RuntimeError("indexing failed")
 
         monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
-
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T001"},
-            files={"file": ("notes.md", b"# Title", "text/markdown")},
-        )
-
+        resp = post(client)
         assert resp.status_code == 500
         assert resp.json()["detail"] == "Ingestion error: indexing failed"
-
-
-class TestIngestTenant:
-    def test_missing_tenant_id_rejected(self, client):
-        resp = client.post(
-            "/ingest",
-            files={"file": ("notes.md", b"# hi", "text/markdown")},
-        )
-        assert resp.status_code == 422
-
-    def test_malformed_tenant_id_rejected(self, client):
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "../T001"},
-            files={"file": ("notes.md", b"# hi", "text/markdown")},
-        )
-        assert resp.status_code == 422
-
-    def test_unknown_tenant_id_rejected_before_indexing(
-        self, client, server_module, monkeypatch
-    ):
-        indexed = []
-        monkeypatch.setattr(
-            server_module,
-            "index_text_chunk",
-            lambda text, vector_id, metadata: indexed.append(vector_id),
-        )
-        resp = client.post(
-            "/ingest",
-            data={"tenant_id": "T999"},
-            files={"file": ("notes.md", b"# hi", "text/markdown")},
-        )
-        # Same status as /chat's ChatRequest for an unknown tenant.
-        assert resp.status_code == 422
-        assert "tenant_id must be one of" in resp.text
-        assert indexed == []
-
-    def test_same_filename_for_two_tenants_gets_distinct_vector_ids(
-        self, client, server_module, monkeypatch
-    ):
-        monkeypatch.setattr(server_module, "chunk_text", lambda content: iter(["only"]))
-        indexed = {}
-
-        def fake_index(text, vector_id, metadata):
-            indexed[vector_id] = metadata
-            return vector_id
-
-        monkeypatch.setattr(server_module, "index_text_chunk", fake_index)
-
-        for tenant in ("T001", "T002"):
-            resp = client.post(
-                "/ingest",
-                data={"tenant_id": tenant},
-                files={"file": ("faq.md", b"# FAQ", "text/markdown")},
-            )
-            assert resp.status_code == 200
-
-        assert {vid: md["tenant_id"] for vid, md in indexed.items()} == {
-            "T001/faq.md_0": "T001",
-            "T002/faq.md_0": "T002",
-        }
 
 
 class TestChatRequestValidation:

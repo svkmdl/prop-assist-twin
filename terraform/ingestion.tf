@@ -152,15 +152,21 @@ resource "aws_s3_bucket_notification" "rag_docs" {
 # ---------------------------------------------------------------------------
 # DynamoDB ingestion manifest
 # ---------------------------------------------------------------------------
+#
+# The partition key is the document scope ("renters/leases/L-0001", ...; ADR 0002),
+# replacing the former "tenant_id" key. DynamoDB cannot alter a key schema, so
+# applying this change DESTROYS and recreates the table: existing manifest rows are
+# lost by design (the corpus is rebuilt) and vectors indexed before this change are
+# no longer tracked.
 resource "aws_dynamodb_table" "rag_ingestion_manifest" {
   count        = local.rag_ingest_count
   name         = "${local.name_prefix}-rag-ingestion-manifest"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "tenant_id"
+  hash_key     = "scope_key"
   range_key    = "source_sk"
 
   attribute {
-    name = "tenant_id"
+    name = "scope_key"
     type = "S"
   }
 

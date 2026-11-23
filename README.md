@@ -39,7 +39,7 @@ The frontend is statically exported by Next.js and served from S3 behind CloudFr
   * Amazon SageMaker can optionally host a serverless embedding endpoint used by `/embed`, RAG retrieval, and the ingestion worker.
   * S3 (memory bucket) stores conversation history in deployed environments.
   * S3 Vectors can optionally store indexed markdown chunks for RAG-backed `/chat` answers.
-  * S3 (RAG source bucket) receives raw markdown uploads under `incoming/`; the tenant id is derived from the markdown file's direct parent folder (for example, `incoming/Tenants/T001/file.md` -> `T001`) and emits `ObjectCreated` events.
+  * S3 (RAG source bucket) receives markdown uploads under `incoming/` in a strict key layout (audience, scope, document type, document id and business version; see [Document keys](#document-keys-and-front-matter)) and emits `ObjectCreated` events.
   * SQS queue + dead-letter queue buffer ingestion events and isolate failures.
   * A second Lambda (ingestion worker) consumes the queue, validates, chunks, embeds, and indexes documents.
   * DynamoDB stores the ingestion manifest for idempotency and status tracking.
@@ -73,7 +73,7 @@ flowchart TD
   RESP --> UI[Render answer and source snippets]
 
   subgraph Ingestion[Knowledge ingestion event-driven pipeline]
-    MD[Admin uploads markdown to S3 incoming/.../tenant_id/file.md] --> EVT[S3 ObjectCreated event]
+    MD[Admin uploads markdown to S3 incoming/{audience}/{scope}/.../v{n}.md] --> EVT[S3 ObjectCreated event]
     EVT --> SQS[SQS ingest queue]
     SQS --> WORK[Ingestion worker Lambda]
     WORK --> SAFE[Validate extension, size, UTF-8, and checksum]
@@ -89,7 +89,7 @@ flowchart TD
 
 `/chat` is a grounded generation pipeline with a small query-rewrite step in front of retrieval. The backend keeps recent chat state, rewrites follow-up questions into standalone search queries when needed, retrieves candidate chunks from S3 Vectors, reranks them with distance and lexical overlap signals, caps repeated chunks from the same document, and injects the selected snippets into the model prompt as a `RETRIEVED KNOWLEDGE` block.
 
-Retrieval is tenant-aware. Each request carries an optional `tenant_id` (defaulting to `admin`); for real tenants (`T001`, `T002`) the vector query is scoped with an S3 Vectors metadata filter (`{"tenant_id": {"$eq": ...}}`) so a session only sees its own documents, while `admin` queries across all tenants. The tenant is fixed to a session on its first turn and persisted alongside the conversation, so later turns cannot switch tenants.
+Retrieval is tenant-aware. Each request carries an optional `tenant_id` (the server pins anonymous callers to one configured tenant, see the chat-scope note below; a key holder's omitted value means `admin`); each principal is resolved server-side to a **scope** from `backend/data/registry.json` (a tenant's leases and properties, or staff). The vector query carries the S3 Vectors metadata filter built from that scope (renters: renter-audience documents that are company-wide, in one of their properties or in one of their leases, and in force today; staff: everything in force) and every returned hit is re-checked in code, so a session only sees its own documents and renters never see `staff/` documents. The principal is fixed to a session on its first turn and persisted alongside the conversation, so later turns cannot switch it.
 
 The final Bedrock Nova call is instructed by `backend/context.py` to answer in the user's language, use retrieved sources for company/listing/process/policy facts, and cite only the injected `[S#]` snippets. If RAG is disabled or the embedding/vector dependencies are missing, the app falls back to normal prompt-only Bedrock chat while still preserving session memory.
 
@@ -163,10 +163,10 @@ In deployed environments, document ingestion is fully decoupled from the chat La
 
 ### Flow
 
-1. An admin uploads a markdown file to the RAG source bucket under `incoming/`, with the tenant id as the markdown file's direct parent folder (for example, `incoming/Tenants/T001/{document}.md` or `incoming/T001/{document}.md`).
+1. An admin uploads a markdown file with front matter to the RAG source bucket under `incoming/`, following the [key layout](#document-keys-and-front-matter) (for example, `incoming/renters/leases/L-0001/contracts/lease-contract/v1.md`).
 2. The S3 `ObjectCreated` event (filtered to the `incoming/` prefix and `.md` suffix) is delivered to an SQS queue.
 3. The ingestion worker Lambda consumes the queue (batch size 1, partial-batch failure reporting enabled) and for each document:
-   - reads the object from S3 and validates extension, size, and UTF-8 content,
+   - reads the object from S3 and validates the key layout, size, UTF-8 content and front matter (one shared code path, `common/prepare.py`, also used by `/ingest` and the offline corpus validator),
    - computes a SHA-256 checksum and checks the DynamoDB manifest for idempotency,
    - chunks the content, embeds each chunk via the SageMaker endpoint, and writes vectors to S3 Vectors with deterministic IDs,
    - updates the manifest status and chunk count;
@@ -176,19 +176,44 @@ In deployed environments, document ingestion is fully decoupled from the chat La
 
 | Scenario | Behavior |
 | --- | --- |
-| Invalid file (bad extension, non-UTF-8, empty, too large) | Manifest marked `FAILED`; message acknowledged (no retry) |
+| Key outside the layout (including every key of the former `incoming/{tenant}/...` layout), create or delete event | Acknowledged (no retry, no DLQ); nothing is read, indexed, deleted or recorded |
+| Invalid file (bad front matter, non-UTF-8, empty, too large) | Manifest marked `FAILED` with every problem listed; message acknowledged (no retry) |
 | Duplicate upload (same version/checksum already `SUCCEEDED`) | Manifest marked `SKIPPED`; no re-indexing (stale-version cleanup is re-attempted) |
+| New business version (`v2.md` next to `v1.md`) | A different key: both stay indexed; retrieval picks the one in force on the date asked about |
 | Overwrite (new S3 version of an indexed key) | New version indexed, then older versions' vectors deleted and marked `SUPERSEDED`. The current version is read via `HeadObject`, so out-of-order SQS delivery cannot let an old version win. Skipped if the bucket is unversioned or the object no longer exists |
 | Embedding or vector-write failure | Message retried via SQS; after `max_receive_count`, routed to the DLQ |
 | Throttling from the serverless embedding endpoint | Absorbed by adaptive botocore retries (`EMBEDDING_MAX_ATTEMPTS`) |
 
+### Document keys and front matter
+
+```text
+incoming/{staff|renters}/company/{doc_type}/{doc_id}/v{n}.md
+incoming/{staff|renters}/properties/{property_id}/{doc_type}/{doc_id}/v{n}.md
+incoming/renters/leases/{lease_id}/{doc_type}/{doc_id}/v{n}.md
+```
+
+`doc_type` is one of `contracts`, `policies`, `sops`, `statements`; `doc_id` is a lowercase slug; `v{n}` is the **business version** (each version is its own key); `property_id` looks like `P-001` and `lease_id` like `L-0001` (opaque, no personal data). The path alone decides audience (`staff` documents are never shown to renters), scope and document identity. Each file starts with a front-matter block:
+
+```text
+---
+title: Reparaturrichtlinie
+language: de
+effective_from: 2027-01-01
+effective_to: 2027-12-31
+---
+```
+
+`effective_to` is optional (omitted = open-ended); dates are strict `YYYY-MM-DD`. Design and rationale: [`docs/adr/0002-document-key-layout-and-access-scopes.md`](docs/adr/0002-document-key-layout-and-access-scopes.md). Validate a document tree offline with `cd backend && uv run python -m common.corpus` (see `backend/corpus/README.md`).
+
 ### Vector IDs and metadata
 
-Vectors use deterministic IDs of the form `{tenant_id}/{doc_id}/{source_version_or_sha256}/{chunk_index}`, so retries safely overwrite the same chunks. Each vector stores `tenant_id`, `source_bucket`, `source_key`, `source_version`, `title`, `doc_type`, `chunk_index`, `chunk_text`, `embedding_model`, and `ingested_at`.
+Vectors use deterministic IDs of the form `{audience}/{scope}[/{id}]/{doc_type}/{doc_id}/v{n}/{source_version_or_sha256}/{chunk_index}`, so retries safely overwrite the same chunks and equal file names in different scopes never collide. Each vector stores `audience`, `scope_type`, `property_id` (property scope only), `lease_id` (lease scope only), `doc_type`, `doc_id`, `doc_version`, `language`, `effective_from` and `effective_to` (integers `YYYYMMDD`; open-ended = `99991231`), `title`, `source_key`, `source_bucket`, `source_version`, `chunk_index`, `chunk_text`, `embedding_model`, and `ingested_at`. There is no `tenant_id`.
+
+> **Retrieval** uses these fields: renters see company-wide documents, those of their properties and their own leases that are in force today; staff see everything in force. Vectors indexed under the former layout stay in the index untracked (the manifest table is replaced) and are invisible to everyone, since they lack `audience` and the dates; they are not removed automatically. Confirm that the real index honours the filter operators with `cd backend && uv run python -m common.filter_probe --bucket <vector-bucket> --index <index> --yes` (owner-approved: it writes probe vectors and deletes them again; see the module docstring), and re-run it after any change to the filter or the metadata fields. Use the bucket and index **names** (`terraform output -raw s3vectors_bucket_name` / `s3vectors_index_name`), not ARNs. A `NOTE` about list-valued probes is expected: S3 Vectors matches array-valued metadata when any element matches; the ingestion pipeline never writes lists and the per-hit check drops them. A `PROBLEM` line is a failure (`FILTER TOO LAX` means documents outside a scope were returned).
 
 ### DynamoDB manifest
 
-The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `tenant_id`; sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, and `SUPERSEDED`.
+The `rag_ingestion_manifest` table (on-demand billing) tracks every ingestion attempt. Partition key is `scope_key` (for example `renters/leases/L-0001`; it replaced `tenant_id`, and changing the key schema **replaces the table**); sort key is `{source_key}#{source_version_or_sha256}`. Allowed statuses are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, and `SUPERSEDED`.
 
 ### Observability
 
@@ -196,7 +221,7 @@ Three CloudWatch alarms cover the pipeline: DLQ message count, worker Lambda err
 
 ### Local development
 
-The synchronous `POST /ingest` endpoint still exists, but it is only registered when `LOCAL_DEV=true`. It exercises the same chunking/embedding/indexing logic in-process for quick local testing and is not exposed through API Gateway in deployed environments.
+The synchronous `POST /ingest` endpoint still exists, but it is only registered when `LOCAL_DEV=true`. It takes a `source_key` in the layout above plus the file, runs the same preparation code as the worker (`common/prepare.py`) and writes the same metadata, and is not exposed through API Gateway in deployed environments.
 
 * * *
 
@@ -216,7 +241,8 @@ The synchronous `POST /ingest` endpoint still exists, but it is only registered 
 │   │   ├── worker.py                  # SQS handler with partial-batch failures
 │   │   ├── ingest_document.py         # Read, validate, chunk, embed, index one doc
 │   │   └── manifest.py                # DynamoDB ingestion-status access
-│   ├── data/kb/                      # Markdown knowledge base for ingestion
+│   ├── data/registry.json            # Synthetic registry: tenants, leases, properties, staff (ships in the Lambda ZIP)
+│   ├── corpus/                       # Synthetic German document corpus mirroring the RAG bucket (not shipped; see its README)
 │   │   ├── areas.md
 │   │   ├── buying_process.md
 │   │   ├── company_faq.md
@@ -342,6 +368,8 @@ curl -X POST http://localhost:8000/chat \
   -d '{"message":"Which property would you recommend for a family?"}'
 ```
 
+> **Chat scope.** Locally (`LOCAL_DEV=true`, no `ADMIN_API_KEY`) `/chat` accepts any `tenant_id`. In a deployed environment anonymous callers are pinned to `PUBLIC_CHAT_TENANT_ID` (403 for any other tenant, 503 if unset); send `x-api-key` to choose a tenant such as `admin`.
+
 Admin-only endpoints require `x-api-key` when `ADMIN_API_KEY` is set:
 
 ```bash
@@ -352,8 +380,8 @@ curl -X POST http://localhost:8000/embed \
 
 curl -X POST http://localhost:8000/ingest \
   -H "x-api-key: $ADMIN_API_KEY" \
-  -F "tenant_id=T001" \
-  -F "file=@data/kb/company_faq.md"
+  -F "source_key=incoming/renters/company/policies/repair-policy/v1.md" \
+  -F "file=@repair-policy.md"   # a markdown file that starts with front matter
 ```
 
 > The `/ingest` route is only available when `LOCAL_DEV=true`. In deployed
@@ -374,8 +402,41 @@ drops below it.
 Run the golden chat evaluation against a deployed or local API:
 
 ```bash
-API_BASE_URL=http://localhost:8000 uv run python eval_chat.py
+API_URL=http://localhost:8000 uv run python eval_chat.py
 ```
+
+The runner reads `API_URL` (not `API_BASE_URL`) and these optional variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EVAL_CASES` | `evals/golden_chat_cases.jsonl` | Fixture to run |
+| `EVAL_TIMEOUT_SECONDS` | `60` | Per-request timeout |
+| `EVAL_RESULTS` | unset | Write a machine-readable run record (JSON) to this path; unset writes no file |
+| `EVAL_API_KEY` | unset | Sent as `x-api-key` (privileged scope). Environment only; never written to the record or printed. Refused over plain HTTP to a non-local host |
+
+Behaviour:
+
+- The whole fixture is validated first. A line that is not valid JSON, has an unknown key (for example a typo such as `",min_sources"`), has a wrong type, or defines no check is a fixture error: exit **2**, no API call. The same validation runs offline in `tests/test_eval_fixtures.py`.
+- Every case gets its own session (`eval-<run>-<n>`), so reruns and case order cannot influence each other.
+- Each case ends as **PASS**, **FAIL** (an assertion or an unexpected 4xx) or **ERROR** (transport failure, 5xx, unreadable body). A dead or refusing API produces ERRORs with the detail, not a traceback. Exit **0** = all passed, **1** = any FAIL or ERROR, **2** = could not run or write results.
+- The run record holds the run id, dataset path and SHA-256, the target's public `/health` flags (model, RAG, public-chat), per-case status/HTTP status/latency/effective tenant/sources/failures/answer excerpt, and a summary with p50/p95 latency over the answered requests (the sample size `n` is included; with a handful of cases p95 is just the maximum).
+- A case may set `tenant_id` and `expect_status` to test refusals (then only `must_not_contain` applies, to the raw refusal text).
+
+Labeled property-management cases (100 cases, 17 categories: lease and property facts, precedence, outdated versions, co-tenants, English, triage, escalation, staff questions, unanswerable, privacy, isolation, injection) run against the synthetic corpus in `backend/corpus/`. They need an **ingested** deployment, and to act as different tenants a privileged caller (`EVAL_API_KEY`, or a `LOCAL_DEV` server):
+
+```bash
+API_URL=http://localhost:8000 EVAL_API_KEY=... EVAL_CASES=evals/property_cases.jsonl EVAL_RESULTS=run.json uv run python eval_chat.py
+```
+
+Results are also reported per `category`. The cases name their `expected_docs` (evidence document references); the runner does not score retrieval against them yet because the API does not return source document IDs (ADR 0002 slice 6). Offline, `tests/test_eval_corpus_alignment.py` proves the labels agree with the corpus and the access rules; see `docs/use_case.md` for the acceptance criteria.
+
+Access-boundary smoke check for a deployed, contained API. Run it **anonymously** (no `EVAL_API_KEY`). Both cases expect the same `403`: anonymous `admin` and an unregistered tenant are refused alike, and the refusal text must not reveal which tenants exist. It fails if either gets an answer or a different status, and reports ERROR (503) if anonymous chat is disabled because `PUBLIC_CHAT_TENANT_ID` is unset:
+
+```bash
+API_URL=https://<api> EVAL_CASES=evals/access_boundary_cases.jsonl uv run python eval_chat.py
+```
+
+Against a deployed API, anonymous requests are pinned to `PUBLIC_CHAT_TENANT_ID`. This runner measures one live answer per case; it does not yet compute retrieval Recall@k or grounding scores.
 
 ---
 
@@ -425,6 +486,8 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run build
 | `EMBEDDING_MAX_ATTEMPTS` | no | `10` | Max adaptive botocore retries for SageMaker `InvokeEndpoint` (absorbs serverless throttling) |
 | `ADMIN_API_KEY` | for deployed admin routes | empty | Shared admin key for `/embed` and `/conversation/{session_id}` (and local `/ingest`) |
 | `LOCAL_DEV` | no | `false` | Allows admin endpoints without a key when no admin key is set, and registers the local `/ingest` route |
+| `PUBLIC_CHAT_TENANT_ID` | for public chat | empty | The single synthetic-only **registered tenant** (see `backend/data/registry.json`) whose scope anonymous `/chat` callers receive. Empty or invalid (staff such as `admin`, or unregistered) disables anonymous chat (503). `x-api-key` with `ADMIN_API_KEY` lifts the pin. Terraform: `public_chat_tenant_id`. See `docs/adr/0003-p0-public-chat-containment.md` |
+| `NEXT_PUBLIC_SHOW_TENANT_PICKER` | no | unset | Frontend build flag: `true` shows the tenant picker for local development only. It is not authorization |
 | `MAX_MESSAGE_CHARS` | no | `3000` | Maximum incoming chat message length |
 | `MAX_UPLOAD_BYTES` | no | `1048576` | Maximum markdown upload size for ingestion |
 | `LOG_LEVEL` | no | `INFO` | Backend logging level |
@@ -574,21 +637,21 @@ Required GitHub secrets:
 
 ## RAG knowledge ingestion
 
-The repository includes seed markdown knowledge under `backend/data/kb`. In a deployed environment, ingest it by uploading the files to the RAG source bucket under `incoming/`, with the tenant id as the direct parent folder of each markdown file. For example, both `incoming/T001/company_faq.md` and `incoming/Tenants/T001/company_faq.md` store vectors with `tenant_id = T001`. Each upload triggers the event-driven pipeline, and you can track progress in the DynamoDB manifest table.
+Documents must follow the [key layout and front matter](#document-keys-and-front-matter). The synthetic corpus lives in `backend/corpus/` (outside `data/`, so staff-only documents never ship in the Lambda ZIP) and mirrors the bucket, so a validated tree is uploaded as is. Uploading changes live AWS state and incurs SageMaker/SQS/Lambda cost: only with the owner's explicit approval.
 
 ```bash
-RAG_DOCS_BUCKET=$(terraform -chdir=terraform output -raw rag_docs_bucket)
-TENANT_ID=T001
-
 cd backend
-for file in data/kb/*.md; do
-  aws s3 cp "$file" "s3://${RAG_DOCS_BUCKET}/incoming/Tenants/${TENANT_ID}/$(basename "$file")"
-done
+uv run python -m common.corpus --require-documents      # same checks the worker applies
+
+RAG_DOCS_BUCKET=$(terraform -chdir=../terraform output -raw rag_docs_bucket)
+aws s3 sync corpus/incoming "s3://${RAG_DOCS_BUCKET}/incoming" --exclude ".*" --exclude "*/.*"
 ```
 
-Only markdown files uploaded under `incoming/` with a `.md` suffix trigger ingestion. The worker validates file size and UTF-8 content, deduplicates by version/checksum, and records status in the manifest. For quick local testing you can instead use the synchronous `POST /ingest` route with `LOCAL_DEV=true`.
+The former seed files in `backend/data/kb/` were removed: they predate the layout (no front matter, no scope) and could not be ingested. The worker acknowledges and ignores any key outside the layout. The worker validates the key, size, UTF-8 content and front matter, deduplicates by version/checksum, and records status in the manifest. For quick local testing you can instead use the synchronous `POST /ingest` route with `LOCAL_DEV=true`.
 
-### K2 corpus (admin tenant PoC dataset)
+### K2 corpus (admin tenant PoC dataset) — superseded
+
+> **No longer applicable.** This workflow uploads to `incoming/Tenants/admin/`, a layout the worker now rejects, and the K2 documents have no front matter. It is kept only as a record; adapting it would need a converter that writes the new layout and front matter. Keep K2 out of any public demo (it is real-world data and the old `admin` partition was unfiltered).
 
 For a larger RAG PoC dataset, the `admin` tenant can be seeded from the [K2 corpus](https://zenodo.org/records/7425489), a public collection of 2,110 German-language documents (contracts, policies, reports) released as two packages:
 
@@ -636,13 +699,19 @@ Request:
 }
 ```
 
-`tenant_id` is optional and defaults to `admin`. Allowed values are `T001`,
-`T002`, and `admin`; any other value is rejected with `422`. Real tenants
-(`T001`, `T002`) scope vector retrieval to their own documents via an S3 Vectors
-metadata filter, while `admin` queries across all tenants (no filter). The
-tenant is bound to the session on its first turn: once a session exists, its
-stored tenant is authoritative and a differing `tenant_id` on later turns is
-ignored.
+`tenant_id` is optional and the **server decides the effective scope**. Only its
+shape is validated (`422` for a malformed value). The registered principals are in
+`backend/data/registry.json`: tenants `T001`-`T004` and staff `admin`. Anonymous
+callers are pinned to `PUBLIC_CHAT_TENANT_ID` (which must be a registered tenant):
+an omitted `tenant_id` resolves to it, **any** other tenant, registered or not (or
+reusing a session bound to another tenant), returns the same `403`, and `503`
+means anonymous chat is disabled. Only a caller with a valid `x-api-key` may choose
+a principal (an omitted value means `admin`; an unregistered one is `422`).
+Renters retrieve from company-wide documents, their properties' and their own
+leases'; `admin` is staff and sees everything in force. The principal is bound to
+the session on its first turn: once a session exists, its stored principal is
+authoritative. See `docs/adr/0003-p0-public-chat-containment.md` and
+`docs/adr/0002-document-key-layout-and-access-scopes.md`.
 
 Response shape:
 
@@ -672,7 +741,7 @@ Embeds text using the configured SageMaker endpoint. Requires `x-api-key` when `
 
 ### `POST /ingest` admin (local only)
 
-Accepts a markdown upload plus a required `tenant_id` form field (one of the allowed tenants, e.g. `T001`), applies semantic chunking via LangChain's `RecursiveCharacterTextSplitter` (respecting paragraph/line/word boundaries while maintaining size limits), embeds each chunk, and writes vectors plus metadata (including `tenant_id`, so tenant-filtered chat retrieval can find them) to S3 Vectors under `{tenant_id}/{filename}_{chunk}` IDs. This route is only registered when `LOCAL_DEV=true` and is intended for local development; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
+Accepts a markdown upload plus a required `source_key` form field in the [key layout](#document-keys-and-front-matter) (for example `incoming/renters/leases/L-0001/contracts/lease-contract/v1.md`; the upload's own file name is ignored). It runs the same preparation as the worker (key grammar, size, UTF-8, front matter, `RecursiveCharacterTextSplitter` chunking), embeds each chunk, and writes vectors with the worker's metadata under `{key}/local/{chunk}` IDs, so re-uploading a key overwrites its own chunks. Errors: `422` key outside the layout, `413` over `MAX_UPLOAD_BYTES`, `400` invalid content (the detail lists every problem). The operator chooses the scope, exactly like the S3 key for the worker; this is not a pattern for user-facing paths. The route is only registered when `LOCAL_DEV=true`; deployed ingestion runs through the [event-driven pipeline](#event-driven-ingestion-pipeline). See [Semantic text chunking](#semantic-text-chunking) for chunking strategy details.
 
 ### `GET /conversation/{session_id}` admin
 

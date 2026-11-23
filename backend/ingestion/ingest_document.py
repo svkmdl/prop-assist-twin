@@ -1,16 +1,29 @@
-"""Read, validate, chunk, embed, and index a single uploaded markdown document."""
+"""Read, validate, chunk, embed, and index a single uploaded markdown document.
+
+Keys follow the grammar in ``common.doc_keys`` (ADR 0002); everything that does
+not need AWS (key, size, UTF-8, front matter, chunking, metadata) lives in
+``common.prepare`` and is shared with the local ``/ingest`` route and the
+offline corpus validator.
+"""
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 from urllib.parse import unquote_plus
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from common import chunking, config, embeddings, vector_store
+from common import config, embeddings, vector_store
+from common.doc_keys import (
+    DocumentFormatError,
+    DocumentKey,
+    build_vector_id,
+    parse_document_key,
+)
+from common.prepare import PreparedDocument, build_chunk_metadata, prepare_document
 from ingestion import manifest
 
 logger = logging.getLogger(__name__)
@@ -19,6 +32,9 @@ logger = logging.getLogger(__name__)
 _s3_client = None
 _sagemaker_client = None
 _s3vectors_client = None
+
+# Manifest error messages list every problem found; keep the stored text bounded.
+_MAX_ERROR_CHARS = 1000
 
 
 class InvalidDocumentError(Exception):
@@ -62,78 +78,41 @@ def _s3vectors():
     return _s3vectors_client
 
 
-def parse_source_key(source_key: str) -> Tuple[str, str, str]:
-    """Extract ``(tenant_id, doc_id, filename)`` from an ``incoming/`` key.
+def _parse_key(source_key: str) -> DocumentKey:
+    """Parse a source key; a key outside the grammar is a permanent failure.
 
-    The tenant is the direct parent folder of the markdown file.  This supports
-    both ``incoming/{tenant}/{doc}.md`` and deeper layouts such as
-    ``incoming/Tenants/{tenant}/{doc}.md``.
-
-    Raises:
-        InvalidDocumentError: if the key does not match the expected layout.
+    Keys written under the former ``incoming/{tenant}/...`` layout land here and
+    are acknowledged (never retried, never sent to the DLQ).
     """
-    parts = source_key.split("/")
-    if len(parts) < 3 or parts[0] != "incoming":
-        raise InvalidDocumentError(f"Unexpected source key layout: {source_key}")
-
-    tenant_id = parts[-2]
-    filename = parts[-1]
-    if not tenant_id or not filename:
-        raise InvalidDocumentError(f"Unexpected source key layout: {source_key}")
-
-    matched = next((s for s in config.SUPPORTED_SUFFIXES if filename.endswith(s)), None)
-    doc_id = filename[: -len(matched)] if matched else filename
-    return tenant_id, doc_id, filename
-
-
-def _validate(source_key: str, body_bytes: bytes) -> str:
-    """Validate extension/size/UTF-8 and return decoded content.
-
-    Raises:
-        InvalidDocumentError: on any validation failure.
-    """
-    if not any(source_key.endswith(s) for s in config.SUPPORTED_SUFFIXES):
-        allowed = ", ".join(sorted(config.SUPPORTED_SUFFIXES))
-        raise InvalidDocumentError(f"Unsupported extension; allowed: {allowed}")
-    if len(body_bytes) == 0:
-        raise InvalidDocumentError("File is empty")
-    if len(body_bytes) > config.MAX_UPLOAD_BYTES:
-        raise InvalidDocumentError("File too large")
     try:
-        return body_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise InvalidDocumentError("File must be UTF-8 text") from exc
+        return parse_document_key(source_key)
+    except DocumentFormatError as exc:
+        raise InvalidDocumentError(str(exc)) from exc
 
 
 def _index_chunk(
     *,
+    prepared: PreparedDocument,
     chunk_index: int,
     chunk: str,
-    tenant_id: str,
-    doc_id: str,
-    doc_type: str,
     source_bucket: str,
-    source_key: str,
     source_version: str,
     ingested_at: str,
 ) -> str:
     """Embed a single chunk and write it to S3 Vectors with a deterministic id."""
-    vector_id = f"{tenant_id}/{doc_id}/{source_version}/{chunk_index}"
+    vector_id = build_vector_id(prepared.key, source_version, chunk_index)
     embedding = embeddings.embed_text(
         chunk, client=_sagemaker(), endpoint=config.SAGEMAKER_ENDPOINT
     )
-    metadata: Dict[str, Any] = {
-        "tenant_id": tenant_id,
-        "source_bucket": source_bucket,
-        "source_key": source_key,
-        "source_version": source_version,
-        "title": doc_id,
-        "doc_type": doc_type,
-        "chunk_index": chunk_index,
-        "chunk_text": chunk,
-        "embedding_model": config.EMBEDDING_MODEL,
-        "ingested_at": ingested_at,
-    }
+    metadata = build_chunk_metadata(
+        prepared,
+        chunk_index=chunk_index,
+        chunk_text=chunk,
+        source_version=source_version,
+        embedding_model=config.EMBEDDING_MODEL,
+        ingested_at=ingested_at,
+        source_bucket=source_bucket,
+    )
     return vector_store.put_vector(
         client=_s3vectors(),
         bucket=config.VECTOR_BUCKET,
@@ -149,48 +128,47 @@ def process_deletion(
 ) -> Dict[str, Any]:
     """Remove S3-Vectors chunks for a permanently-deleted S3 object version.
 
-    Returns a summary dict ``{"status", "tenant_id", "vectors_deleted"}``.
+    Returns a summary dict ``{"status", "scope_key", "vectors_deleted"}``.
 
     Raises:
         InvalidDocumentError: for permanent failures (ack the message).
         Exception: for transient failures (let SQS retry / route to the DLQ).
     """
     source_key = unquote_plus(key)
-    tenant_id, doc_id, _filename = parse_source_key(source_key)
+    doc_key = _parse_key(source_key)
 
     if not version_id:
         raise InvalidDocumentError(f"Delete event for {source_key} missing versionId")
 
     source_sk = manifest.build_sort_key(source_key, version_id)
-    record = manifest.get_record(tenant_id, source_sk)
+    record = manifest.get_record(doc_key.scope_key, source_sk)
     if not record or record.get("status") not in (manifest.SUCCEEDED, manifest.SKIPPED):
         logger.info(
             "No indexed vectors for %s@%s; nothing to delete", source_key, version_id
         )
-        return {"status": "noop", "tenant_id": tenant_id, "vectors_deleted": 0}
+        return {"status": "noop", "scope_key": doc_key.scope_key, "vectors_deleted": 0}
 
     deleted = _delete_version_vectors(
-        tenant_id=tenant_id,
-        doc_id=doc_id,
+        key=doc_key,
         source_version=version_id,
         chunk_count=record.get("chunk_count", 0),
     )
-    manifest.mark_deleted(tenant_id=tenant_id, source_sk=source_sk)
+    manifest.mark_deleted(scope_key=doc_key.scope_key, source_sk=source_sk)
 
     logger.info("Deleted %d vectors for %s@%s", deleted, source_key, version_id)
     return {
         "status": "deleted",
-        "tenant_id": tenant_id,
+        "scope_key": doc_key.scope_key,
         "vectors_deleted": deleted,
     }
 
 
 def _delete_version_vectors(
-    *, tenant_id: str, doc_id: str, source_version: str, chunk_count: int
+    *, key: DocumentKey, source_version: str, chunk_count: int
 ) -> int:
     """Delete the deterministic vector ids of one indexed document version."""
     vector_ids = [
-        f"{tenant_id}/{doc_id}/{source_version}/{i}" for i in range(chunk_count)
+        build_vector_id(key, source_version, i) for i in range(chunk_count)
     ]
     vector_store.delete_vectors(
         client=_s3vectors(),
@@ -218,26 +196,28 @@ def _current_s3_version(bucket: str, source_key: str) -> Optional[str]:
     return version if version and version != "null" else None
 
 
-def _supersede_stale_versions(
-    *, bucket: str, source_key: str, tenant_id: str, doc_id: str
-) -> int:
-    """Remove vectors of every indexed version that is not S3's current version.
+def _supersede_stale_versions(*, bucket: str, key: DocumentKey) -> int:
+    """Remove vectors of every indexed S3 version that is not S3's current version.
 
-    S3 overwrites create a new version with new vector ids; without this the
-    old version's chunks stay searchable and compete with the new content.
-    Comparing against S3's *current* version (rather than "the version just
-    processed") keeps this correct when SQS delivers versions out of order: a
-    stale version that finishes last removes its own vectors.
+    S3 overwrites of the *same key* create a new version with new vector ids;
+    without this the old version's chunks stay searchable and compete with the
+    new content. Comparing against S3's *current* version (rather than "the
+    version just processed") keeps this correct when SQS delivers versions out
+    of order: a stale version that finishes last removes its own vectors.
+
+    Business versions (``v1.md``, ``v2.md``) are different keys and are never
+    touched here: both stay indexed, and retrieval picks the one in force.
     """
-    current = _current_s3_version(bucket, source_key)
+    current = _current_s3_version(bucket, key.source_key)
     if current is None:
         logger.info(
-            "Current version of %s unknown; skipping stale-version cleanup", source_key
+            "Current version of %s unknown; skipping stale-version cleanup",
+            key.source_key,
         )
         return 0
 
     superseded = 0
-    for record in manifest.list_versions(tenant_id, source_key):
+    for record in manifest.list_versions(key.scope_key, key.source_key):
         version = record.get("source_version", "")
         if version == current or record.get("status") not in (
             manifest.SUCCEEDED,
@@ -245,19 +225,18 @@ def _supersede_stale_versions(
         ):
             continue
         deleted = _delete_version_vectors(
-            tenant_id=tenant_id,
-            doc_id=doc_id,
+            key=key,
             source_version=version,
             chunk_count=record.get("chunk_count", 0),
         )
         manifest.mark_status(
-            tenant_id=tenant_id,
+            scope_key=key.scope_key,
             source_sk=record["source_sk"],
             status=manifest.SUPERSEDED,
         )
         superseded += 1
         logger.info(
-            "Superseded %s@%s (%d vectors removed)", source_key, version, deleted
+            "Superseded %s@%s (%d vectors removed)", key.source_key, version, deleted
         )
     return superseded
 
@@ -267,14 +246,15 @@ def process_document(
 ) -> Dict[str, Any]:
     """Ingest one markdown object from S3.
 
-    Returns a summary dict ``{"status", "tenant_id", "chunk_count"}``.
+    Returns a summary dict ``{"status", "scope_key", "chunk_count", ...}``.
 
     Raises:
         InvalidDocumentError: for permanent validation failures (ack the message).
         Exception: for transient failures (let SQS retry / route to the DLQ).
     """
     source_key = unquote_plus(key)
-    tenant_id, doc_id, _filename = parse_source_key(source_key)
+    doc_key = _parse_key(source_key)
+    scope_key = doc_key.scope_key
 
     # --- Transient: read object from S3 (failures here should be retried) ---
     get_kwargs: Dict[str, Any] = {"Bucket": bucket, "Key": source_key}
@@ -290,31 +270,31 @@ def process_document(
 
     # --- Permanent: validate + chunk (failures here mark FAILED and ack) ---
     try:
-        content = _validate(source_key, body_bytes)
-        chunks: List[str] = list(
-            chunking.chunk_text(
-                content, size=config.CHUNK_SIZE, overlap=config.CHUNK_OVERLAP
-            )
+        prepared = prepare_document(
+            source_key,
+            body_bytes,
+            max_bytes=config.MAX_UPLOAD_BYTES,
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
         )
-        if not chunks:
-            raise InvalidDocumentError("Document produced no content chunks")
-        doc_type = next(s for s in config.SUPPORTED_SUFFIXES if source_key.endswith(s))
-    except InvalidDocumentError as exc:
+    except DocumentFormatError as exc:
+        message = str(exc)
         manifest.put_status(
-            tenant_id=tenant_id,
+            scope_key=scope_key,
             source_sk=source_sk,
             status=manifest.FAILED,
             source_bucket=bucket,
             source_key=source_key,
             source_version=source_version,
             sha256=sha256,
-            error_message=str(exc),
+            error_message=message[:_MAX_ERROR_CHARS],
         )
-        logger.warning("Validation failed for %s: %s", source_key, exc)
-        raise
+        logger.warning("Validation failed for %s: %s", source_key, message)
+        raise InvalidDocumentError(message) from exc
+    chunks = prepared.chunks
 
     # --- Idempotency: skip if this exact version already succeeded ---
-    existing = manifest.get_record(tenant_id, source_sk)
+    existing = manifest.get_record(scope_key, source_sk)
     if (
         existing
         and existing.get("status") == manifest.SUCCEEDED
@@ -322,7 +302,7 @@ def process_document(
     ):
         logger.info("Skipping already-ingested document %s", source_sk)
         manifest.put_status(
-            tenant_id=tenant_id,
+            scope_key=scope_key,
             source_sk=source_sk,
             status=manifest.SKIPPED,
             source_bucket=bucket,
@@ -337,21 +317,19 @@ def process_document(
         # Re-run cleanup on redelivery so a cleanup failure on the first
         # delivery (which raised and triggered the retry) is eventually healed.
         superseded = (
-            _supersede_stale_versions(
-                bucket=bucket, source_key=source_key, tenant_id=tenant_id, doc_id=doc_id
-            )
+            _supersede_stale_versions(bucket=bucket, key=doc_key)
             if resolved_version
             else 0
         )
         return {
             "status": manifest.SKIPPED,
-            "tenant_id": tenant_id,
+            "scope_key": scope_key,
             "chunk_count": existing.get("chunk_count", len(chunks)),
             "versions_superseded": superseded,
         }
 
     manifest.put_status(
-        tenant_id=tenant_id,
+        scope_key=scope_key,
         source_sk=source_sk,
         status=manifest.RUNNING,
         source_bucket=bucket,
@@ -372,13 +350,10 @@ def process_document(
             futures = [
                 executor.submit(
                     _index_chunk,
+                    prepared=prepared,
                     chunk_index=idx,
                     chunk=chunk,
-                    tenant_id=tenant_id,
-                    doc_id=doc_id,
-                    doc_type=doc_type,
                     source_bucket=bucket,
-                    source_key=source_key,
                     source_version=source_version,
                     ingested_at=ingested_at,
                 )
@@ -388,7 +363,7 @@ def process_document(
                 future.result()
     except Exception as exc:
         manifest.put_status(
-            tenant_id=tenant_id,
+            scope_key=scope_key,
             source_sk=source_sk,
             status=manifest.FAILED,
             source_bucket=bucket,
@@ -399,13 +374,13 @@ def process_document(
             vector_index=config.VECTOR_INDEX,
             embedding_model=config.EMBEDDING_MODEL,
             chunk_count=len(chunks),
-            error_message=str(exc),
+            error_message=str(exc)[:_MAX_ERROR_CHARS],
         )
         logger.error("Indexing failed for %s: %s", source_key, exc)
         raise
 
     manifest.put_status(
-        tenant_id=tenant_id,
+        scope_key=scope_key,
         source_sk=source_sk,
         status=manifest.SUCCEEDED,
         source_bucket=bucket,
@@ -422,15 +397,13 @@ def process_document(
     # Only meaningful with S3 versioning: without a VersionId the content hash
     # is the version and there is no notion of which one is current.
     superseded = (
-        _supersede_stale_versions(
-            bucket=bucket, source_key=source_key, tenant_id=tenant_id, doc_id=doc_id
-        )
+        _supersede_stale_versions(bucket=bucket, key=doc_key)
         if resolved_version
         else 0
     )
     return {
         "status": manifest.SUCCEEDED,
-        "tenant_id": tenant_id,
+        "scope_key": scope_key,
         "chunk_count": len(chunks),
         "versions_superseded": superseded,
     }

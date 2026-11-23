@@ -29,6 +29,11 @@ interface Message {
     sources?: SourceItem[];
 }
 
+// The tenant picker is a local-development aid only. It is NOT authorization:
+// the API decides the scope server-side (docs/adr/0003). Public builds leave
+// this unset, hide the picker and send no tenant_id.
+const SHOW_TENANT_PICKER = process.env.NEXT_PUBLIC_SHOW_TENANT_PICKER === 'true';
+
 export default function Twin() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
@@ -69,10 +74,26 @@ export default function Twin() {
                 body: JSON.stringify({
                     message: input,
                     session_id: sessionId || undefined,
-                    tenant_id: tenantId,
+                    ...(SHOW_TENANT_PICKER ? { tenant_id: tenantId } : {}),
                 }),
             });
 
+            // Scope refusals come from the server (docs/adr/0003); show them plainly.
+            if (response.status === 503 || response.status === 403) {
+                setMessages(prev => [
+                    ...prev,
+                    {
+                        id: (Date.now() + 1).toString(),
+                        role: 'assistant',
+                        content:
+                            response.status === 503
+                                ? 'Der Chat ist derzeit nicht verfügbar.'
+                                : 'Kein Zugriff auf diesen Bereich.',
+                        timestamp: new Date(),
+                    },
+                ]);
+                return;
+            }
             if (!response.ok) throw new Error('Das Senden der Nachricht ist fehlgeschlagen');
 
             const data : ChatResponse = await response.json();
@@ -226,29 +247,33 @@ export default function Twin() {
 
             {/* Input */}
             <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
-                {/* Tenant selector */}
-                <div className="flex items-center gap-2 mb-3">
-                    <label
-                        htmlFor="tenant-select"
-                        className="text-xs font-medium text-gray-500 whitespace-nowrap"
-                    >
-                        Tenant
-                    </label>
-                    <select
-                        id="tenant-select"
-                        value={tenantId}
-                        onChange={(e) => setTenantId(e.target.value)}
-                        disabled={isTenantLocked || isLoading}
-                        className="text-xs px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-600 disabled:opacity-50 disabled:cursor-not-allowed bg-white text-gray-700"
-                    >
-                        <option value="T001">T001</option>
-                        <option value="T002">T002</option>
-                        <option value="admin">admin</option>
-                    </select>
-                    {isTenantLocked && (
-                        <span className="text-xs text-slate-400 italic">Session active</span>
-                    )}
-                </div>
+                {/* Tenant selector: local development only, not authorization */}
+                {SHOW_TENANT_PICKER && (
+                    <div className="flex items-center gap-2 mb-3">
+                        <label
+                            htmlFor="tenant-select"
+                            className="text-xs font-medium text-gray-500 whitespace-nowrap"
+                        >
+                            Tenant
+                        </label>
+                        <select
+                            id="tenant-select"
+                            value={tenantId}
+                            onChange={(e) => setTenantId(e.target.value)}
+                            disabled={isTenantLocked || isLoading}
+                            className="text-xs px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-600 disabled:opacity-50 disabled:cursor-not-allowed bg-white text-gray-700"
+                        >
+                            <option value="T001">T001</option>
+                            <option value="T002">T002</option>
+                            <option value="T003">T003</option>
+                            <option value="T004">T004</option>
+                            <option value="admin">admin</option>
+                        </select>
+                        {isTenantLocked && (
+                            <span className="text-xs text-slate-400 italic">Session active</span>
+                        )}
+                    </div>
+                )}
                 <div className="flex gap-2">
                     <input
                         type="text"
