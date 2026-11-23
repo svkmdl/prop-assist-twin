@@ -196,6 +196,17 @@ variable "chunk_overlap" {
   default     = 200
 }
 
+variable "public_chat_tenant_id" {
+  description = "P0 containment: the single, synthetic-only tenant scope anonymous /chat callers are pinned to. Empty (default) disables anonymous chat. Never 'admin'. Callers with the admin API key may still choose a scope."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.public_chat_tenant_id != "admin" && can(regex("^[A-Za-z0-9_-]{0,32}$", var.public_chat_tenant_id))
+    error_message = "public_chat_tenant_id must be empty or a tenant id of at most 32 characters [A-Za-z0-9_-], and must not be 'admin'."
+  }
+}
+
 variable "admin_api_key" {
   description = "Temporary admin API key for /ingest, /embed, and /conversation. Will use real OIDC/SAML/Cognito etc for production."
   type        = string

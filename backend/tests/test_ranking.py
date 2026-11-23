@@ -9,6 +9,10 @@ import json
 import pytest
 from fastapi import HTTPException
 
+from scope_helpers import STAFF, md
+
+AUTH = md()  # schema fields the per-hit authorization check requires
+
 
 class FakeBody:
     def __init__(self, payload):
@@ -82,6 +86,7 @@ class TestRetrieveSourcesDistanceFilter:
                 "key": "near",
                 "distance": 0.1,
                 "metadata": {
+                    **AUTH,
                     "title": "A",
                     "source_path": "kb/a.md",
                     "chunk_text": "balcony in berlin",
@@ -91,6 +96,7 @@ class TestRetrieveSourcesDistanceFilter:
                 "key": "far",
                 "distance": 0.9,
                 "metadata": {
+                    **AUTH,
                     "title": "B",
                     "source_path": "kb/b.md",
                     "chunk_text": "balcony in berlin",
@@ -101,8 +107,8 @@ class TestRetrieveSourcesDistanceFilter:
             server_module, "search_text_chunks", lambda query, top_k, metadata_filter=None: hits
         )
 
-        sources = server_module.retrieve_sources("balcony")
-        ids = [s.id for s in sources]
+        sources = server_module.retrieve_sources("balcony", scope=STAFF)
+        ids = [s.vector_key for s in sources]
         assert "near" in ids
         assert "far" not in ids
 

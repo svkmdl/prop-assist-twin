@@ -84,7 +84,7 @@ CONVERSATION_SCENARIOS = [
 def test_chat_conversation_scenarios(
     client, server_module, monkeypatch, session_id, turns
 ):
-    def fake_retrieve_sources(message: str, tenant_id=None):
+    def fake_retrieve_sources(message: str, scope=None):
         return [
             server_module.SourceItem(**data)
             for data in STUBBED_SOURCES.get(message, [])

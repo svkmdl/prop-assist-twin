@@ -9,6 +9,8 @@ import pytest
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
 
+from scope_helpers import STAFF
+
 
 def _client_error(code: str) -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": "boom"}}, "Converse")
@@ -77,14 +79,24 @@ class TestTenantValidation:
         resp = client.post("/chat", json={"message": "hi", "tenant_id": "INVALID_TENANT"})
         assert resp.status_code == 422
 
+    def test_malformed_tenant_id_returns_422_without_listing_tenants(self, client):
+        resp = client.post("/chat", json={"message": "hi", "tenant_id": "../T001"})
+        assert resp.status_code == 422
+        assert "T001" not in resp.json()["detail"][0]["msg"]  # the shape is public, the tenants are not
+
+    def test_unregistered_tenant_is_rejected_by_name_only_for_privileged_callers(self, client):
+        body = client.post("/chat", json={"message": "hi", "tenant_id": "T999"})
+        assert body.status_code == 422
+        assert body.json() == {"detail": "Unknown tenant_id"}  # no list of valid tenants
+
     def test_valid_tenant_ids_accepted(self, client, server_module, monkeypatch):
-        monkeypatch.setattr(server_module, "retrieve_sources", lambda q, tenant_id=None: [])
+        monkeypatch.setattr(server_module, "retrieve_sources", lambda q, scope=None: [])
         monkeypatch.setattr(
             server_module,
             "call_bedrock",
             lambda conv, msg, sources=None: "ok",
         )
-        for tenant in ("T001", "T002", "admin"):
+        for tenant in ("T001", "T002", "T003", "T004", "admin"):
             resp = client.post("/chat", json={"message": "hi", "tenant_id": tenant})
             assert resp.status_code == 200, f"Expected 200 for tenant {tenant!r}"
             assert resp.json()["tenant_id"] == tenant
@@ -92,7 +104,7 @@ class TestTenantValidation:
     def test_stored_tenant_wins_over_request_tenant(self, client, server_module, monkeypatch):
         """Once a session is created with T001, a follow-up request claiming T002
         must still resolve to T001 from storage."""
-        monkeypatch.setattr(server_module, "retrieve_sources", lambda q, tenant_id=None: [])
+        monkeypatch.setattr(server_module, "retrieve_sources", lambda q, scope=None: [])
         monkeypatch.setattr(
             server_module,
             "call_bedrock",
@@ -116,7 +128,7 @@ class TestTenantValidation:
 class TestRetrieveSourcesFallback:
     def test_disabled_returns_empty(self, server_module, monkeypatch):
         monkeypatch.setattr(server_module, "is_rag_enabled", lambda: False)
-        assert server_module.retrieve_sources("query") == []
+        assert server_module.retrieve_sources("query", scope=STAFF) == []
 
     def test_search_failure_returns_empty(self, server_module, monkeypatch):
         monkeypatch.setattr(server_module, "is_rag_enabled", lambda: True)
@@ -125,7 +137,7 @@ class TestRetrieveSourcesFallback:
             raise RuntimeError("vector store down")
 
         monkeypatch.setattr(server_module, "search_text_chunks", boom)
-        assert server_module.retrieve_sources("query") == []
+        assert server_module.retrieve_sources("query", scope=STAFF) == []
 
 
 class TestRewriteQuery:
