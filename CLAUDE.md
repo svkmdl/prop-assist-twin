@@ -58,13 +58,21 @@ backend/
   eval_chat.py                 Live HTTP evaluation harness; NOT a mocked unit test
   evals/golden_chat_cases.jsonl  Four golden prompts and response assertions
   me.txt                       Additional persona notes; not imported by current code
-  data/kb/*.md                 Five example knowledge documents; NOT auto-indexed by source control
+  data/registry.json           Synthetic registry (properties, leases, tenants, staff); ships in the Lambda ZIP with data/
+  corpus/                      Synthetic German corpus (19 logical documents, 21 files) mirroring the RAG bucket, kept outside data/ so staff-only documents never ship in the ZIP; see corpus/README.md
+  evals/property_cases.jsonl   100 labeled property-management cases (17 categories) over that corpus; see docs/use_case.md
   common/
     config.py                  Import-time configuration for ingestion/shared modules
     models.py                  SourceItem Pydantic model
     chunking.py                RecursiveCharacterTextSplitter helper
     embeddings.py              SageMaker endpoint invocation and response parsing
     vector_store.py            S3 Vectors put/query/delete functions
+    doc_keys.py                Pure document key grammar, front matter, metadata/vector-ID builders (ADR 0002 slice 1; NOT yet used by the worker or retrieval)
+    prepare.py                 Shared bytes -> ingestible document step (key, size, UTF-8, front matter, chunks, metadata); used by the worker, /ingest and the corpus validator
+    registry.py                Synthetic tenant -> lease -> property registry loader (reads data/registry.json)
+    corpus.py                  Offline corpus validator: `uv run python -m common.corpus`
+    access.py                  Pure access scopes (ADR 0002): Scope, StaticScopeResolver, build_vector_filter, is_authorized; used by /chat retrieval since slice 4
+    filter_probe.py            Owner-run LIVE check of the S3 Vectors filter operators (WRITES probe vectors, then deletes them): `python -m common.filter_probe`
   ingestion/
     worker.py                  SQS Lambda handler with partial-batch failure contract
     ingest_document.py         S3 object validation, chunk/embed/index and deletion logic
@@ -107,10 +115,12 @@ The five markdown KB files cover listings, areas, buying process, company FAQ, a
 ```text
 frontend/components/twin.tsx
   POST ${NEXT_PUBLIC_API_URL}/chat
-       {message, session_id?, tenant_id}
+       {message, session_id?, tenant_id?}   (+ optional x-api-key)
     -> backend/server.py:chat()
        -> load_conversation(session_id) from S3 or local JSON
-       -> keep the stored tenant if the session already exists
+       -> resolve_chat_tenant(): server decides scope (P0 containment, ADR 0003);
+          anonymous -> PUBLIC_CHAT_TENANT_ID only (else 403/503), admin key -> caller's choice;
+          a stored session tenant is never widened
        -> rewrite_query() with Nova Micro if history exists
        -> retrieve_sources(query, effective tenant)
           -> SageMaker embed_text() -> S3 Vectors query_vectors()
@@ -121,7 +131,7 @@ frontend/components/twin.tsx
   Render response with [S1], [S2], ... source cards
 ```
 
-- `frontend/components/twin.tsx` defaults the UI tenant to `T001`; server-side `ChatRequest` defaults to `admin` when the caller omits the field. Do not confuse these defaults.
+- `ChatRequest.tenant_id` is optional. **Anonymous callers are pinned server-side** to `PUBLIC_CHAT_TENANT_ID` (Terraform `public_chat_tenant_id`, default empty = anonymous chat disabled, 503). A different tenant in the body, or a session bound to another tenant, returns 403 before retrieval or Bedrock. Only a caller with a valid `x-api-key` (or `LOCAL_DEV=true` with no `ADMIN_API_KEY`) may choose a tenant, including `admin`; for them an omitted `tenant_id` still means `admin`. The UI tenant picker is shown only with `NEXT_PUBLIC_SHOW_TENANT_PICKER=true` (local development); otherwise the frontend sends no `tenant_id`. See `docs/adr/0003-p0-public-chat-containment.md`.
 - Frontend session ID is React state (not persistent browser storage). The tenant dropdown locks after the first successful response; this is only UI behavior, **not authentication**.
 - The API stores a UUID for a new session. Existing sessions honor the stored tenant, even if a later request submits a different `tenant_id`. Old list-format session files have no tenant binding.
 - Only the last **20** history messages go to the answer model. Query rewriting uses the last **5** history messages, not the entire transcript.
@@ -133,30 +143,30 @@ frontend/components/twin.tsx
 `server.py` controls the retrieval path; `common/` provides AWS/client-agnostic helpers.
 
 1. `is_rag_enabled()` requires `RAG_ENABLED` **and** all three nonempty values `SAGEMAKER_ENDPOINT`, `VECTOR_BUCKET`, `VECTOR_INDEX`.
-2. For `T001` or `T002`, retrieval forwards the S3 Vectors metadata filter `{"tenant_id": {"$eq": "T001"}}` (substitute the actual tenant). For `admin` or `None`, **no** tenant filter is applied.
+2. `retrieve_sources(query, ..., *, scope)` takes a **required, keyword-only** `common.access.Scope` (there is no unfiltered retrieval). It sends `build_vector_filter(scope)` to S3 Vectors and then re-checks **every returned hit** with `is_authorized`; a hit outside the scope is dropped and logged (role/principal and a count, never content). Renter scope: `audience = renter` and (company-wide, or one of the tenant's properties, or one of its leases) and in force on `as_of` (today in Europe/Berlin). Staff scope: any known audience/scope, still within the date window. Vectors without the ADR 0002 schema (including everything indexed before it) match nothing for anyone. The operators used are exactly `common.access.FILTER_OPERATORS_USED` (`$and`, `$or`, `$eq`, `$in`, `$lte`, `$gte`); a live run against the `dev` index (2026-11-23, `python -m common.filter_probe`) confirmed they are accepted as nested and that missing keys and wrong types match nothing. It also found that **S3 Vectors matches array-valued metadata when any element matches**, so a vector with `lease_id: ["L-0001", "L-0002"]` is returned for both leases' filters. Ingestion only writes plain strings, so this cannot occur today, and `is_authorized` drops every non-string where a string belongs: that check is **load-bearing**, so never loosen it. Re-run the probe after any change to the filter shape, the metadata fields or the index. A search failure still degrades to no sources (`retrieval_used=false`), so an unsupported operator would show up as silently empty retrieval, not as an error.
 3. Query embedding calls SageMaker with `{"inputs": text}`. `common/embeddings.py` handles common nested vector-response shapes.
 4. Fetch `RAW_FETCH_SIZE` candidate vectors (default **12**); optionally reject vectors whose distance exceeds `MAX_RETRIEVAL_DISTANCE` (code default unset; Terraform default **0.5**).
 5. Rerank candidates via `(1.0 - distance) + (0.5 * lexical_score)`. The lexical score is a **custom single-document BM25-inspired approximation**, NOT corpus-based BM25, even though `rank-bm25` is a declared dependency.
 6. Keep at most `MAX_CHUNKS_PER_DOC` (**2**) chunks per document, then return up to `FINAL_TOP_K` (**3**) source items.
-7. Document grouping (`_document_group_key`) uses `source_path`, else `source_key`, else `title`, else `unknown`, prefixed with `tenant_id` when present (so same-named docs of different tenants stay distinct under admin retrieval). `source_key` is used for grouping only and is never exposed in responses or the prompt. `shorten_snippet` normalizes whitespace; response snippets default to **280** chars and model context to **1,500** chars per source.
+7. Document grouping (`_document_group_key`) uses `source_path`, else `source_key`, else `title`, else `unknown`; `source_key` is scope-qualified and unique per business version, so same-named documents in different leases/properties/audiences stay distinct. `source_key` is used for grouping only and is never exposed in responses or the prompt. `shorten_snippet` normalizes whitespace; response snippets default to **280** chars and model context to **1,500** chars per source.
 8. `build_retrieval_block()` numbers final sources `[S1]`, `[S2]`, etc. `SourceItem.context` is internal (`exclude=True`) and must not appear in public JSON.
 
-**Metadata compatibility:** the ingestion worker writes `source_key` but not `source_path`, whereas `/ingest` writes `source_path` and `tenant_id` (no `source_key`). Thus worker-indexed sources have a null `source_path` in chat responses (deliberately: the raw S3 key reveals bucket layout and tenant folders), but grouping still distinguishes them via `source_key`. Both paths currently set `doc_type` from the filename suffix (usually `.md`), while the `README.md` example shows `"markdown"`; follow code, not the illustrative example, when updating tests or clients. Consider compatibility and a backfill/migration before changing metadata keys.
+**Metadata compatibility (changed by ADR 0002 slice 3):** the worker and `/ingest` now write the **same** metadata through one builder (`common.prepare.build_chunk_metadata`): `audience`, `scope_type`, `property_id`/`lease_id` (their scope only), `doc_type` (now the vocabulary `contracts|policies|sops|statements`, no longer the file suffix), `doc_id`, `doc_version`, `language`, `effective_from`/`effective_to` (ints `YYYYMMDD`, open-ended `99991231`), `title`, `source_key`, `chunk_*`, and so on; **no `tenant_id` and no `source_path`**. Sources therefore still have a null `source_path` in chat responses (the raw S3 key reveals bucket layout; do not expose `source_key`), and `_document_group_key` groups via `source_key`. Retrieval now filters on these fields (ADR 0002 slice 4, see §3.2 step 2); nothing filters on `tenant_id` any more.
 
 ### 3.3 Document ingestion (production path)
 
 ```text
-S3 versioned rag-docs bucket: incoming/.../{tenant}/{document}.md
+S3 versioned rag-docs bucket: incoming/{staff|renters}/{company|properties/P-id|leases/L-id}/{doc_type}/{doc_id}/v{n}.md
   S3 ObjectCreated notification, suffix filtered
     -> SQS ingest queue
        -> ingestion.worker.handler (Lambda; ReportBatchItemFailures)
           -> ingestion.ingest_document.process_document()
              S3 GetObject [specific VersionId when provided]
-             -> UTF-8/extension/size validation
-             -> RecursiveCharacterTextSplitter
+             -> common.prepare.prepare_document(): key grammar, size, UTF-8, front matter,
+                RecursiveCharacterTextSplitter on the body (front matter is not embedded)
              -> concurrent SageMaker embeddings (adaptive retries)
-             -> deterministic S3 Vector IDs and tenant_id metadata
-             -> DynamoDB ingestion manifest
+             -> deterministic S3 Vector IDs and scope/document metadata
+             -> DynamoDB ingestion manifest (partition = scope_key)
          transient errors -> retry -> SQS DLQ after maxReceiveCount
   S3 ObjectRemoved:Delete notification
     -> ingestion.ingest_document.process_deletion()
@@ -164,13 +174,13 @@ S3 versioned rag-docs bucket: incoming/.../{tenant}/{document}.md
        -> mark manifest record DELETED
 ```
 
-- `parse_source_key()` requires a key beginning `incoming/` with at least three path components. Tenant is **the immediate parent folder** of the file: `incoming/T001/faq.md` and `incoming/Tenants/T001/faq.md` both resolve to `T001`.
-- Default supported extension is `.md` (configured via `SUPPORTED_SUFFIXES`); documents must be nonempty UTF-8 and at most `MAX_UPLOAD_BYTES` (**1,048,576** bytes). Defaults: `CHUNK_SIZE=1500`, `CHUNK_OVERLAP=200`.
-- Use S3 `VersionId`, if supplied or returned by the object, else content SHA-256 as `source_version`. Manifest sort key: `source_key#source_version`; partition key: `tenant_id`.
-- Chunk vector ID: `{tenant_id}/{doc_id}/{source_version}/{chunk_index}`. Metadata includes `tenant_id`, `source_bucket`, `source_key`, `source_version`, `title`, `doc_type`, `chunk_index`, `chunk_text`, `embedding_model`, `ingested_at`.
+- `common.doc_keys.parse_document_key()` is the **strict, table-driven** key grammar (ADR 0002): `incoming/{staff|renters}/company/...`, `incoming/{staff|renters}/properties/{P-id}/...`, `incoming/renters/leases/{L-id}/...`, then `{doc_type}/{doc_id}/v{n}.md`. Audience, scope, IDs, `doc_type`, `doc_id` and the business version come from the path only; title, language and effective dates from the front matter (`parse_front_matter`: flat `key: value`, required `title`, `language` `de|en`, `effective_from`, optional `effective_to`, strict ISO dates). The former tenant-folder layout (`incoming/T001/...`, `incoming/Tenants/...`) is no longer parsed: such create **and delete** events are acknowledged without reading S3, indexing, deleting or touching the manifest. Unit level is not accepted yet (one grammar row to add later).
+- The grammar fixes the `.md` suffix; `SUPPORTED_SUFFIXES`/`supported_suffixes` only filters S3 notifications. Documents must be nonempty UTF-8 and at most `MAX_UPLOAD_BYTES` (**1,048,576** bytes). Defaults: `CHUNK_SIZE=1500`, `CHUNK_OVERLAP=200`. Each business version is its own key and stays indexed; effective dates decide which one retrieval uses.
+- Use S3 `VersionId`, if supplied or returned by the object, else content SHA-256 as `source_version`. Manifest sort key: `source_key#source_version`; partition key: `scope_key` (`DocumentKey.scope_key`, e.g. `renters/leases/L-0001`; it replaced `tenant_id`, which **replaced the DynamoDB table** because a key schema cannot be altered).
+- Chunk vector ID: `{relative key without incoming/ and .md}/{percent-encoded source_version}/{chunk_index}` (`build_vector_id`; S3 VersionIds may contain `/` or `+`), e.g. `renters/leases/L-0001/contracts/lease-contract/v1/<s3version>/0`. Metadata: see "Metadata compatibility" above plus `source_bucket`, `source_version`, `embedding_model`, `ingested_at`.
 - `manifest.py` defines `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `SKIPPED`, `DELETED`, `SUPERSEDED`; the active ingest code writes `RUNNING`/`SUCCEEDED`/`FAILED`/`SKIPPED`/`SUPERSEDED`, and deletion writes `DELETED`.
 - `SUCCEEDED` + same SHA-256 is considered a duplicate and marked `SKIPPED`; other cases get (re)indexed. Vector writes may run in a thread pool with `INGESTION_MAX_WORKERS` limited to **1..8** (default **4**).
-- **Permanent** invalid documents (`InvalidDocumentError`) are logged/acknowledged and are not sent to the DLQ; when a manifest key can be established, validation failures mark it `FAILED`. **Transient** unexpected errors return an SQS `batchItemFailures` entry for retry. Do not replace this distinction with blanket exception swallowing.
+- **Permanent** invalid documents (`InvalidDocumentError`, which wraps `common.doc_keys.DocumentFormatError`) are logged/acknowledged and are not sent to the DLQ; when a manifest key can be established (valid key), validation failures mark it `FAILED` with every problem listed (bounded to 1,000 characters). **Transient** unexpected errors return an SQS `batchItemFailures` entry for retry. Do not replace this distinction with blanket exception swallowing.
 - Deletion requires a matching *versioned* manifest record, uses `common.vector_store.delete_vectors()` (batches of at most **500** IDs), then marks history `DELETED`.
 
 **Be careful with S3 versioning:** validate how real `ObjectRemoved:Delete`/`DeleteMarkerCreated` events carry version IDs before changing deletion behavior. The currently configured notification only subscribes to `s3:ObjectRemoved:Delete`, while deletion logic expects an indexed object's matching version. **Overwrites:** after a successful (or skipped) ingest, `_supersede_stale_versions()` reads the key's current version via `HeadObject` and deletes vectors of every other `SUCCEEDED`/`SKIPPED` version (manifest `SUPERSEDED`, found via `manifest.list_versions()` = DynamoDB `Query`, requiring `dynamodb:Query` IAM). Using S3's current version, not "the version just processed", keeps out-of-order delivery safe. Cleanup is skipped for unversioned buckets and when the object is gone (404/delete marker). Not handled: permanently deleting the *current* version makes S3 serve the previous version again, whose vectors were already superseded. Options, trade-offs, consequences and the pending real-event verification plan are in `docs/adr/0001-supersede-stale-vector-versions.md`; the behavior is **mock-tested only** until that plan has been run in `dev`.
@@ -179,10 +189,10 @@ S3 versioned rag-docs bucket: incoming/.../{tenant}/{document}.md
 
 ### 3.4 Locally exposed synchronous ingestion
 
-`POST /ingest` is only **registered** when `LOCAL_DEV=true`. It accepts multipart fields `file` and a **required** `tenant_id` (pattern + `ALLOWED_TENANT_IDS` via the shared `check_allowed_tenant()`; missing, malformed or unknown -> 422, matching `/chat`), validates a safe filename, supported extension, UTF-8, and upload size, then indexes chunks synchronously with `tenant_id` metadata and vector IDs `{tenant_id}/{filename}_{n}`. It is guarded by `require_admin_api_key` unless local mode explicitly permits an absent key. This is **not** the deployed production ingestion path. API Gateway Terraform does not define a `/ingest` route.
+`POST /ingest` is only **registered** when `LOCAL_DEV=true`. It accepts multipart `file` plus a **required** `source_key` form field (max 300 characters) in the same grammar as the worker's S3 keys, then runs the same `prepare_document()` and `build_chunk_metadata()` as the worker. Statuses: key outside the grammar -> **422**, upload over `MAX_UPLOAD_BYTES` -> **413**, invalid content (empty, not UTF-8, front matter, no chunks) -> **400** with every problem in the detail. The upload's own file name is ignored. It indexes chunks synchronously with vector IDs `{relative key}/local/{n}`. It is guarded by `require_admin_api_key` unless local mode explicitly permits an absent key. This is **not** the deployed production ingestion path. API Gateway Terraform does not define a `/ingest` route.
 
-- **Trust model:** the partition is chosen by the operator calling this admin-gated, local-only route, just as the S3 folder chooses it for the worker. With `LOCAL_DEV=true` and no `ADMIN_API_KEY` it is plain request input. Do not copy this pattern into user-facing paths; production scope comes from verified claims (§9.1, §9.4, §13.3.1).
-- **Local index leftovers:** vectors indexed before tenant-prefixed IDs (`{filename}_{n}`, no `tenant_id`) are not overwritten by re-uploads and stay visible to `admin` retrieval as duplicates. A re-upload that produces fewer chunks also leaves the old trailing `{tenant_id}/{filename}_{n}` chunks in place, because `/ingest` keeps no manifest. Reset or clean the local/dev vector index if this matters; do not rely on `/ingest` for document lifecycle.
+- **Trust model:** the scope is chosen by the operator calling this admin-gated, local-only route through `source_key`, just as the S3 key chooses it for the worker. With `LOCAL_DEV=true` and no `ADMIN_API_KEY` it is plain request input. Do not copy this pattern into user-facing paths; production scope comes from verified claims (§9.1, §9.4, §13.3.1).
+- **Local index leftovers:** `/ingest` keeps no manifest and uses the fixed source version `local`, so re-uploading a key overwrites the same vector IDs, but a re-upload that produces **fewer** chunks leaves the old trailing chunks in place. Vectors from the former `/ingest` (`{tenant_id}/{filename}_{n}`) are never overwritten. Reset or clean the local/dev vector index if this matters; do not rely on `/ingest` for document lifecycle.
 
 ## 4. HTTP contract and error behavior
 
@@ -192,16 +202,16 @@ Defined in `backend/server.py`:
 | --- | --- | --- |
 | `GET /` | Informational assistant/storage/model response | Public |
 | `GET /health` | Returns configured feature flags and `status: healthy`; **not** a live AWS service health probe | Public |
-| `POST /chat` | `{message: string, session_id?: string, tenant_id?: string}` -> `ChatResponse` | Currently public; caller supplies tenant |
+| `POST /chat` | `{message: string, session_id?: string, tenant_id?: string}` -> `ChatResponse` | Public but **pinned** to `PUBLIC_CHAT_TENANT_ID` (403 other tenant, 503 if unset); `x-api-key` lifts the pin (401 on a wrong key) |
 | `POST /embed` | `{text: string}` -> `{embedding: number[]}` | `x-api-key` admin gate |
 | `GET /conversation/{session_id}` | Returns persisted history | `x-api-key` admin gate |
 | `POST /ingest` | Multipart `file` + `tenant_id` -> indexed chunk count | Only in `LOCAL_DEV=true`; admin gate |
 
-`ChatRequest.message`: length **1..MAX_MESSAGE_CHARS** (default **3000**). Session IDs: `^[A-Za-z0-9_-]{1,64}$`. Tenant IDs must match `^[A-Za-z0-9_-]{1,32}$` **and** one of `T001`, `T002`, `admin` from `common/config.py`.
+`ChatRequest.message`: length **1..MAX_MESSAGE_CHARS** (default **3000**). Session IDs: `^[A-Za-z0-9_-]{1,64}$`. `tenant_id` must match `^[A-Za-z0-9_-]{1,32}$` (shape only; a malformed value is 422). Which principals exist is data in `backend/data/registry.json` (`common/registry.py`, loaded by `server.py`; override with `REGISTRY_PATH`): synthetic tenants `T001`-`T004` with their leases and properties, and staff `admin`. **Anonymous callers get the same 403 for any tenant other than `PUBLIC_CHAT_TENANT_ID`, registered or not** (no oracle for which tenants exist); a privileged caller naming an unregistered tenant gets `422 {"detail": "Unknown tenant_id"}`. A stored session whose tenant left the registry is 403 for everyone. An unusable registry file does not crash the API: it stays empty, every chat request is refused (anonymous 503; a key holder gets 403 without a `tenant_id` and 422 "Unknown tenant_id" when naming one, since no principal is registered) and `/health` shows `registry_loaded: false`.
 
-`ChatResponse`: `response`, `session_id`, `tenant_id`, `sources: SourceItem[]`, `retrieval_used`. Source fields: `id`, `title?`, `source_path?`, `snippet`, `doc_type?`, `chunk_index?`, `distance?`; internal `context` is excluded from serialization.
+`ChatResponse`: `response`, `session_id`, `tenant_id`, `sources: SourceItem[]`, `retrieval_used`. Source fields: `id`, `title?`, `source_path?`, `snippet`, `doc_type?`, `chunk_index?`, `distance?`. `id` is **positional** (`S1`, `S2`, ... matching the `[S#]` citations); the vector key (which encodes scope, lease/property ids and S3 version ids) is kept in the internal `vector_key` and, like `context`, is excluded from serialization. Anonymous callers cannot continue an untagged legacy (list-format) session that has history: 403, like any other scope mismatch.
 
-Admin access: when `ADMIN_API_KEY` is configured, verify `x-api-key` via `hmac.compare_digest`. When missing and `LOCAL_DEV=true`, admin endpoints are **open** by design of this PoC. When missing outside local development, they return **503**; bad/missing key with a configured key returns **401**. `/chat` does **not** use this admin gate. Keep API Gateway route definitions synchronized with any new API paths.
+Admin access: when `ADMIN_API_KEY` is configured, verify `x-api-key` via `hmac.compare_digest`. When missing and `LOCAL_DEV=true`, admin endpoints are **open** by design of this PoC. When missing outside local development, they return **503**; bad/missing key with a configured key returns **401**. `/chat` does not use `require_admin_api_key`, but reads the same key via `is_privileged_chat_caller()` to decide whether the caller may choose its tenant. Keep API Gateway route definitions synchronized with any new API paths.
 
 ## 5. Frontend implementation constraints
 
@@ -243,6 +253,7 @@ npm run dev
 
 ```bash
 cd backend && uv run pytest -q
+cd backend && uv run python -m common.corpus   # corpus validator (also run by pytest)
 cd frontend && npm run lint && npx tsc --noEmit && npm run build
 cd terraform && terraform fmt -check -recursive
 # After provider initialization and when infrastructure validation is relevant:
@@ -258,9 +269,9 @@ cd backend
 API_URL=http://localhost:8000 uv run python eval_chat.py
 ```
 
-`EVAL_CASES` and `EVAL_TIMEOUT_SECONDS` override case path and request timeout. `eval_chat.py` loads JSONL and checks response text/source/citation heuristics. Its four cases are **not** deterministic isolated unit tests, and passing them does not establish grounding correctness.
+`EVAL_CASES`, `EVAL_TIMEOUT_SECONDS`, `EVAL_RESULTS` (optional JSON run record) and `EVAL_API_KEY` (optional `x-api-key`; env only, never recorded, refused over cleartext HTTP to non-local hosts) configure the run. The runner reads `API_URL` (the README previously said `API_BASE_URL`; fixed 2026-11-22). `eval_chat.py` loads JSONL, **validates every line first** (unknown key, wrong type, empty needle, duplicate id or a case with no check is a fixture error: exit code 2, no API call; `tests/test_eval_fixtures.py` runs the same check offline in CI), then runs each case in its own session (`eval-<run>-<n>`) and records PASS / FAIL (assertion or unexpected 4xx) / ERROR (transport, 5xx, unreadable body) with latency; exit 0 = all passed, 1 = any FAIL/ERROR, 2 = fixture/transport-safety/results-write problem. Cases may set `tenant_id` and `expect_status` to test refusals; `evals/access_boundary_cases.jsonl` is the deployed-API smoke check for the P0 containment (run it anonymously). The checks are response text/source/citation heuristics. On 2026-11-22 the golden file parsed as JSON but three keys had a stray leading comma (`",min_sources"` x2, `",must_not_contain"` x1) so the runner silently skipped those checks; fixed. Its four cases are **not** deterministic isolated unit tests, and passing them does not establish grounding correctness.
 
-**Milestone 1 evaluation contract (planned, not implemented):** validate JSONL fixture parsing in CI, give each case an independent session, separate fast deterministic/security tests from live model-quality evaluation, and emit machine-readable runs plus a Markdown summary with dataset/version, model/config, retrieval Recall@k, grounding/citation, refusal, isolation, p50/p95 latency, errors and measured usage/cost. Reference expected source document IDs, not just answer keywords. Do not claim the fixture is malformed solely from an earlier report: the archive review above says parsing passed; rerun the check on the actual checkout. Likewise verify the README-versus-runner API environment variable spelling before editing. Proposed output paths are in §13.7.
+**Milestone 1 evaluation contract (fixture validation, independent sessions, per-case error reporting, a JSON run record with dataset hash, `/health` flags and p50/p95 latency are implemented; the rest is planned):** validate JSONL fixture parsing in CI (done), give each case an independent session (done), separate fast deterministic/security tests from live model-quality evaluation, and emit machine-readable runs plus a Markdown summary with dataset/version, model/config, retrieval Recall@k, grounding/citation, refusal, isolation, p50/p95 latency, errors and measured usage/cost. Reference expected source document IDs, not just answer keywords. The fixture check has been re-run on the actual checkout (see above) and the README/runner variable spelling reconciled. Proposed output paths are in §13.7.
 
 **Observed verification for this archive:** Python syntax compilation, `bash -n` for both scripts, frontend JSON parsing, and JSONL parsing passed. The full pytest, npm, Terraform and real AWS integration checks were **not executed** in this review environment. In particular Python 3.12 was unavailable there; do not claim those checks passed until re-run on a configured machine.
 
@@ -286,7 +297,8 @@ Key application variables:
 | `SUPPORTED_SUFFIXES`, `MAX_UPLOAD_BYTES` | ingestion `.md`, 1048576 bytes |
 | `INGESTION_MAX_WORKERS`, `EMBEDDING_MAX_ATTEMPTS` | 4 and 10; workers clamped 1..8 |
 | `MANIFEST_TABLE`, `RAG_DOCS_BUCKET`, `EMBEDDING_MODEL` | worker manifest/source/model configuration |
-| `ADMIN_API_KEY`, `LOCAL_DEV` | admin gate, local-only ingestion registration; empty/false |
+| `ADMIN_API_KEY`, `LOCAL_DEV` | admin gate (also lifts the `/chat` tenant pin), local-only ingestion registration; empty/false |
+| `PUBLIC_CHAT_TENANT_ID` | the one synthetic-only tenant anonymous `/chat` is pinned to; empty (default) or invalid (`admin`, unknown) disables anonymous chat (503). Terraform: `public_chat_tenant_id` |
 | `MAX_MESSAGE_CHARS`, `LOG_LEVEL` | 3000 and INFO |
 
 Keep `backend/pyproject.toml`, `backend/uv.lock`, and **`backend/requirements.txt`** consistent when dependencies change: development uses uv; `backend/deploy.py` packages production dependencies with `pip install -r requirements.txt` inside the AWS Python 3.12 Docker image. Changing one dependency file alone can leave Lambda different from local development.
@@ -297,6 +309,7 @@ Keep `backend/pyproject.toml`, `backend/uv.lock`, and **`backend/requirements.tx
 
 - `sagemaker_embedding_enabled` defaults to **false**. Enables SageMaker model, serverless endpoint and invoke permissions; the container image URI must be supplied for a real deployment.
 - `s3vectors_enabled` defaults to **false**. Enables S3 Vectors bucket/index; default dimension **384**, metric `cosine`, index `property-kb`. The embedding model and vector index dimension must match.
+- `public_chat_tenant_id` defaults to **empty**: anonymous `/chat` is disabled until the owner sets a tenant that holds **synthetic data only** (never `admin`; Terraform validates this). Because `main` auto-deploys to `dev`, merging the containment disables anonymous chat there until it is set.
 - `rag_ingest_enabled` defaults to **false**. Adds versioned source-doc S3 bucket, S3 notifications, SQS, DLQ, DynamoDB manifest, worker Lambda and CloudWatch alarms. Requires the vector and embedding resources to actually exist.
 - `rag_enabled` defaults to **true** but does not by itself provision RAG infrastructure. The chat API disables retrieval when endpoint/bucket/index are absent.
 - `use_custom_domain` defaults **false**. If enabled, Route 53 and an ACM certificate in `us-east-1` are involved; changes can alter DNS and TLS behavior.
@@ -332,22 +345,26 @@ Treat the provided `deploy.yml` as the content of `.github/workflows/deploy.yml`
 - **Outputs/cache:** selects the Terraform workspace and reads `cloudfront_url`, `api_gateway_url`, and `s3_frontend_bucket`; searches the CloudFront distribution list for a matching S3 website-origin hostname and issues an invalidation (`/*`) if one is found; prints URL/bucket summary. This discovery relies on reconstructing an AWS website hostname: the authoritative origin in Terraform is `aws_s3_bucket_website_configuration.frontend.website_endpoint`. Prefer an explicit Terraform `cloudfront_distribution_id` output if this lookup is unreliable. Confirm that CloudFront invalidation ran rather than assuming it always succeeds.
 - **Secrets referenced in this YAML:** `AWS_ROLE_ARN`, `DEFAULT_AWS_REGION`, `ADMIN_API_KEY`, and **`AWS_ACCOUNT_ID`**. The root README lists only the first three. The workflow exports `AWS_ACCOUNT_ID` during deploy, but `scripts/deploy.sh` independently obtains the AWS account ID using `aws sts get-caller-identity`, making that export redundant in the supplied script. GitHub Actions environment/repo secret configuration was **not** provided or verified.
 
+**Schema-changing merges apply blind.** There is no `terraform plan` step: a push to `main` runs `terraform apply -auto-approve` (via `scripts/deploy.sh`) right after the tests. The ADR 0002 slice 3 change replaces the DynamoDB manifest table (key `tenant_id` -> `scope_key`); run `terraform plan` locally against the `dev` workspace before merging and follow "Cutover" in `docs/adr/0002-document-key-layout-and-access-scopes.md`. ADR 0002 slice 4 (retrieval) is on the branch and its live filter check has been run once against `dev` (see §3.2 step 2 and the ADR's Verification plan); re-run `python -m common.filter_probe` (owner-approved, it writes and deletes probe vectors) after any filter or metadata change, and run `terraform plan` locally before merging.
+
 **Security/operational guardrails:** before changing CI, check environment protection rules, Terraform state isolation, IAM role trust policy, secret handling, project name, region, and whether a `prod.tfvars` file is available. `main` push currently leads to an automatic `dev` apply; do not turn manual `prod` into an unreviewed deployment. `terraform init -backend=false` validates configuration without the live S3 state, and passing it is not proof that a later remote Terraform apply will succeed.
 
 ### 8.5 Knowledge seeding and the README-only K2 workflow
 
-- The repository has five example markdown documents in `backend/data/kb/`. The README documents manual S3 uploads to `incoming/Tenants/${TENANT_ID}/` on the bucket obtained from `terraform -chdir=terraform output -raw rag_docs_bucket`; S3 notifications, not the build, trigger embedding/indexing. Only run uploads with explicit authorization because they modify live AWS resources and may incur SageMaker/SQS/Lambda charges.
+- The former seed documents in `backend/data/kb/` were removed (no front matter, no scope, not ingestible). The synthetic corpus lives in `backend/corpus/incoming/...` (outside `data/`, so staff-only documents never ship in the Lambda ZIP) and is checked with `cd backend && uv run python -m common.corpus`; the README documents the `aws s3 sync` upload to the bucket from `terraform -chdir=terraform output -raw rag_docs_bucket`. S3 notifications, not the build, trigger embedding/indexing. Only run uploads with explicit authorization because they modify live AWS resources and may incur SageMaker/SQS/Lambda charges.
+- **Superseded:** the K2 workflow below uploads to `incoming/Tenants/admin/`, which the worker now rejects, and K2 documents have no front matter. The README marks it superseded.
 - The root README additionally documents a **K2 German-document corpus** for admin-tenant PoC testing: downloaded XML + matching PDFs under `temp/XML/` and `temp/K2_PDFs/`, converted to markdown, then uploaded in resumable batches (default 10) to `incoming/Tenants/admin/` with tracking in `temp/upload_state.json`. Per the README, the parser can suppress XML elements with `frequent='yes'` as boilerplate; the source PDFs are not parsed for indexing.
 - **Not verified in the code archive:** the K2 corpus itself, `temp/build_corpus_markdown.py`, the claimed `temp/` gitignore rule, and `temp/upload_state.json` were not supplied. Do not invent this script, assert its flags work, or run the README's K2 commands until the helper is obtained and inspected. In particular, K2 documents under `admin` are queryable by the PoC's cross-tenant `admin` retrieval path; treat that route as a security risk rather than a privacy boundary.
 
 ## 9. Security and data-isolation rules (mandatory)
 
 1. **PoC tenant selection is NOT production authentication.** `/chat` is currently unauthenticated; user-controlled `tenant_id` can be `admin`, which removes the vector tenant filter. The frontend exposes this choice. Stored-session tenant locking does not establish user ownership; callers who know a session ID can supply it to `/chat`. Production hardening needs server-verified identity/tenant claims, session ownership checks, and a guarded admin role. This is the planned identity workstream (§13.4). Until it lands, do not build features that place *more* trust in the request-body `tenant_id`.
+   **P0 containment implemented 2026-11-22 (ADR 0003; unit-tested, deployed behavior not yet verified):** anonymous `/chat` is pinned to one configured synthetic tenant and fails closed. It is containment, not authentication; session ownership and verified identity remain Month 3.
    **P0 release gate, effective immediately:** never expose the current anonymous multi-partition chat to real/private data or present it as an authorized multi-tenant service. Before sharing a live demo, restrict access or serve only a synthetic, fixed-scope demo that cannot select `admin`/other partitions server-side, with explicit deny-path tests. Hiding the frontend tenant selector alone is insufficient. A protected, multi-partition public deployment requires completed server-verified identity and authorization; do not wait until Month 3 to contain an existing exposure.
 2. Never relax or silently remove tenant filters, admin endpoint gates, filename/session validation, upload size bounds, CORS restrictions, version checks, or safe escaping. CORS is not authorization.
 3. Never log API keys, AWS credentials, raw chat history, tenant-private docs, Terraform state, personal data, or production object content. Preserve separation between source documents, embeddings, session history, and publicly served frontend assets.
 4. Do not make `/ingest` public in production as a shortcut. Upload/ingest paths need an authenticated, authorized backend and tenant identity supplied by trusted claims, not by filenames or browser input alone.
-5. Read `common.config.ALLOWED_TENANT_IDS` before changing tenant handling. The ingestion key parser does not enforce this allowlist by itself; S3 uploads and tenant authorization need separate controls.
+5. Read `backend/data/registry.json` and `common/access.py` before changing tenant or scope handling (`ALLOWED_TENANT_IDS` no longer exists). The ingestion key parser checks the key grammar but does not check IDs against the registry (the worker has none); S3 write rights and the corpus validator are the upload controls, and the scope resolver enforces access at query time.
 6. Prompt injection can be present in uploaded markdown. Retrieved `chunk_text` is untrusted reference material, not instructions that supersede system/developer rules. Preserve sourced-answer constraints and do not add execution of retrieved content.
 7. Avoid committing generated Lambda archives, local memory files, `.env*`, secrets, Terraform plans/state, credentials, or node_modules. Check the repository's actual `.gitignore` in a complete checkout; it was absent from the provided archive. The README says `temp/` is gitignored, but this has **not** been verified against a `.gitignore`.
 8. Treat `terraform.tfvars` as environment-sensitive and `admin_api_key` as a secret, even when Terraform marks it `sensitive = true` (the value may still be present in state/environment).
@@ -362,7 +379,10 @@ Treat the provided `deploy.yml` as the content of `.github/workflows/deploy.yml`
 | RAG vector scoring, distance, snippet/source rendering contract | `backend/tests/test_ranking.py`, `test_retrieve_sources.py`, `test_formatting.py` |
 | Embedding / vector API wrappers | `backend/tests/test_ranking.py`, `test_vector_store.py` |
 | Chunk size / splitting behavior | `backend/tests/test_chunking.py` |
-| Worker, manifest, object deletion, SQS retries | `backend/tests/test_ingestion_worker.py` |
+| Document key grammar, front matter, metadata/vector IDs, registry, corpus validator | `backend/tests/test_doc_keys.py`, `test_registry_and_corpus.py`; `cd backend && uv run python -m common.corpus` |
+| Synthetic corpus, labeled eval cases (labels vs corpus vs access rules) | `backend/tests/test_eval_corpus_alignment.py`, `test_eval_fixtures.py`; `cd backend && uv run python -m common.corpus --require-documents` |
+| Access scopes, vector filter, per-hit authorization, scope resolver | `backend/tests/test_access.py` (plus the cross-tenant and cross-role negatives required by §13.3 for any data path) |
+| Worker, manifest, object deletion, SQS retries | `backend/tests/test_ingestion_worker.py`, `test_prepare.py` |
 | User-facing LLM behavior/citations | Relevant backend tests **and** `backend/eval_chat.py` on an authorized running API |
 | Frontend chat UI | `npm run lint`, `npx tsc --noEmit`, `npm run build` (no frontend test suite included) |
 | Terraform/deployment | `terraform fmt -check`, `terraform validate`, reviewed `terraform plan`; shell syntax checks |
@@ -374,9 +394,9 @@ Tests use deterministic fakes and monkeypatching instead of real AWS calls; add 
 
 These are findings from the provided implementation, not blanket claims that production currently fails:
 
-- **Authorization gap:** the public chat endpoint accepts user-chosen tenants including `admin`; no verified principal or session-owner authorization is present. Fix before treating this as a real multi-tenant production service. Immediate containment is P0, while full verified identity is scheduled for Month 3 (§13.4).
+- **Authorization gap:** anonymous `/chat` is now pinned to `PUBLIC_CHAT_TENANT_ID` and cannot select `admin` or another partition (ADR 0003), but no verified principal or session-owner authorization exists: anyone with a public-scope session ID can continue that session, the public scope is unthrottled (cost exposure), and the shared admin key is the only elevation path. Fix before treating this as a real multi-tenant production service. Immediate containment is P0, while full verified identity is scheduled for Month 3 (§13.4).
 - **No observability for cost or tracing:** `call_bedrock()` discards the Converse response's `usage` token counts, there is no request/correlation ID, and answer generation runs at `temperature: 0.7`. These belong in the lightweight Month 1 instrumentation and Month 5 LLMOps milestones (§13.4).
-- **Worker vs API metadata mismatch:** event-driven worker has `source_key` but not `source_path`, while local `/ingest` has `source_path` and `tenant_id` but no `source_key`. Retrieval grouping handles both (`_document_group_key`); worker sources still return `source_path: null`. Do not expose `source_key` publicly, and do not silently assume identical schemas.
+- **Worker vs API metadata mismatch: resolved** (ADR 0002 slice 3): both paths share one builder. Vectors indexed before slice 3 (with `tenant_id`, `source_path`, suffix `doc_type`) stay in the index untracked because the manifest table is replaced; they lack `audience` and dates, so the slice 4 filters and per-hit check exclude them for everyone (fail-closed, storage cost only). Worker sources still return `source_path: null`; do not expose `source_key` publicly.
 - **Version/delete lifecycle:** overwrites supersede older versions (see §3.3), but permanently deleting the current version does not re-index the now-current previous version; S3 deletion event types/version IDs and manifestation of delete markers need real-event tests. A successful skip changes status to `SKIPPED`, which does not satisfy the next identical-delivery skip condition.
 - **Import-time `.env` order:** `common.config` is imported ahead of `load_dotenv()` in `server.py`; avoid discrepancies between chat and ingestion configuration.
 - **RAG is feature-gated:** `rag_enabled=true` does not help until embedding and vector components are provisioned/configured. The uploaded development `terraform.tfvars` enables those resources, unlike the Terraform variable defaults; check the selected environment and deployment state. Do not promise source-grounded answers when `retrieval_used=false`.
@@ -428,7 +448,7 @@ Cross-cutting at every stage:
 
 ### 13.1 Terminology: "tenant" has two meanings
 
-- **In the current code**, `tenant_id` (`T001`, `T002`, `admin`) is a **data-isolation partition** for vector metadata, manifest keys, S3 prefixes and sessions. The code does not define what `T001` stands for in business terms (client organization, portfolio or individual renter). Confirm this with the owner before designing identity or new record identifiers.
+- **In the current code**, `tenant_id` is the request-side **principal** (`T001`-`T004` renters, `admin` staff; owner decision 2026-11-22: a renter, i.e. a lease participant). It no longer partitions vectors, manifests or S3 prefixes: documents are scoped to company / property / lease (ADR 0002), and the registry maps each tenant to its leases and properties. It is still unverified request input until the Month 3 identity work. Confirm identifier mappings with the owner before designing new record identifiers.
 - **In the target business workflow**, "tenant" means a **renter (Mieter)**. Renter/occupant identity is not necessarily the data-isolation partition.
 - **Rule:** never silently reuse `tenant_id` to mean renter identity or infer a renter's access scope from a filename. New organization/property/renter identifiers must be explicitly modeled and named before API/storage migrations; preserve compatibility or document migration.
 
@@ -437,7 +457,7 @@ Cross-cutting at every stage:
 | Layer | Present in reviewed code | Target gap / proof |
 | --- | --- | --- |
 | User entry | Static Next.js chat with selectable `T001`/`T002`/`admin` | Authenticated renter/property-manager journeys; deny untrusted scope selection |
-| Identity and access | `/chat` anonymous; user-provided `tenant_id`; sessions tenant-bound but not user-owned | P0 demo containment now, verified principal/session ownership, enforced partition/property/role scopes |
+| Identity and access | `/chat` anonymous but pinned server-side to one configured tenant (P0 containment); admin key lifts the pin; sessions tenant-bound but not user-owned | P0 demo containment now, verified principal/session ownership, enforced partition/property/role scopes |
 | Classification | Single rewrite -> retrieve -> answer path | Narrow typed routing for question / record lookup / action request / escalation |
 | RAG | Markdown, SageMaker embeddings, S3 Vectors, lexical rerank, citation labels; broad admin retrieval | Evaluation-proven retrieval, approved property policies/SOPs/contracts, access/effective-date metadata, multilingual quality and document lifecycle |
 | Structured records | No production property/renter/ticket lookup tool | One simulated/authorized integration with typed, read-only property and ticket data |
@@ -587,3 +607,5 @@ At the start of each month through May 2027, review completed milestones, evalua
 | --- | --- | --- | --- |
 | 2026-11-22 | Prioritize public-demo containment and measured RAG evaluation before agents, full ticketing or infrastructure rewrites | Immediate data-access risk; measured quality and security are prerequisites for further features | Active plan; implementation not verified |
 | 2026-11-22 | Implement S3 overwrite supersession (Month 2 lifecycle item) ahead of sequence, plus `/ingest` tenant scoping and retrieval grouping fixes | Owner request; stale versions stayed searchable. See `docs/adr/0001-supersede-stale-vector-versions.md` | Implemented on branch `fix/rag-source-metadata`, mock-tested; real-event verification in `dev` pending owner-approved deploy. P0 containment still open and next |
+| 2026-11-22 | P0: pin anonymous `/chat` to one configured synthetic tenant, fail closed, admin key lifts the pin; picker dev-only | Owner chose "fix P0 first". See `docs/adr/0003-p0-public-chat-containment.md` | Implemented on branch `fix/rag-source-metadata`, unit/deny-path tested; deployed verification and setting `public_chat_tenant_id` pending owner-approved deploy |
+| 2026-11-22 | Propose company/property/lease key layout, per-version keys, effective dates and scope resolver (SQL-ready) before building the synthetic corpus | Owner request; current single-`tenant_id` model cannot express shared or staff-only documents. See `docs/adr/0002-document-key-layout-and-access-scopes.md` | Proposed. Slices 1-4 implemented and unit-tested (key/front-matter/metadata module, registry, corpus validator, access scopes, worker/manifest/`/ingest`, Terraform manifest key, scope-based retrieval with per-hit check, uniform anonymous refusals). Live-checked once against the `dev` index (2026-11-23): operators accepted; array-valued metadata matches by any element, so the per-hit check is load-bearing. Slice 5 (2026-11-23): synthetic German corpus (21 files), 100 labeled cases, use-case contract `docs/use_case.md`; labels proven consistent offline, never run live. Merging deploys through CI with `terraform apply -auto-approve` and replaces the manifest table |
