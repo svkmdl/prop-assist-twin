@@ -1,0 +1,2 @@
+{"id":"anon_admin_scope_denied","message":"Hallo","tenant_id":"admin","expect_status":403,"must_not_contain":["T001","T002","admin"]}
+{"id":"anon_unregistered_tenant_denied","message":"Hallo","tenant_id":"T999","expect_status":403,"must_not_contain":["T999","unknown","Unknown"]}
