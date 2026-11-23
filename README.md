@@ -62,7 +62,7 @@ flowchart TD
   Q --> RAG{RAG enabled and dependencies configured?}
   RAG -- no --> BASE[Base prompt from backend/context.py]
   RAG -- yes --> EMB[Embed query with SageMaker endpoint]
-  EMB --> VEC[Query S3 Vectors for RAW_FETCH_SIZE candidates, filtered by tenant_id for non-admin tenants]
+  EMB --> VEC["Query S3 Vectors for RAW_FETCH_SIZE candidates, filtered by server-decided access scope, then per-hit authorization check"]
   VEC --> RERANK[Apply distance cutoff, lexical rerank, and per-document cap]
   RERANK --> SRC[Select FINAL_TOP_K source snippets]
   SRC --> BLOCK[Append RETRIEVED KNOWLEDGE block with S1/S2 citation rules]
@@ -73,7 +73,7 @@ flowchart TD
   RESP --> UI[Render answer and source snippets]
 
   subgraph Ingestion[Knowledge ingestion event-driven pipeline]
-    MD[Admin uploads markdown to S3 incoming/{audience}/{scope}/.../v{n}.md] --> EVT[S3 ObjectCreated event]
+    MD["Admin uploads markdown to S3 incoming/#123;audience#125;/#123;scope#125;/.../v#123;n#125;.md"] --> EVT[S3 ObjectCreated event]
     EVT --> SQS[SQS ingest queue]
     SQS --> WORK[Ingestion worker Lambda]
     WORK --> SAFE[Validate extension, size, UTF-8, and checksum]
